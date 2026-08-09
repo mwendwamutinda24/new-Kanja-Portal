@@ -5,7 +5,8 @@ $conn = mysqli_connect(
     getenv('DB_HOST') ?: 'sql104.infinityfree.com',
     getenv('DB_USER') ?: 'if0_40469224',
     getenv('DB_PASS') ?: '16tish2005',
-    getenv('DB_NAME') ?: 'if0_40469224_crudoperation'
+    getenv('DB_NAME') ?: 'if0_40469224_crudoperation',
+    getenv('DB_PORT') ? (int) getenv('DB_PORT') : 3306
 );
 
 if (!$conn) {

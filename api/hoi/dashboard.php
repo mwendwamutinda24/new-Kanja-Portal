@@ -21,7 +21,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit;
 }
 
-require __DIR__ . '/../conn.php'; // adjust path if conn.php lives elsewhere relative to /api/hoi
+require __DIR__ . '/../../conn.php'; // adjust path if conn.php lives elsewhere relative to /api/hoi
 
 function fail($message, $code = 500) {
     http_response_code($code);

@@ -1,5 +1,13 @@
 RewriteEngine On
 
+# Render terminates SSL at its edge and forwards to Apache over plain HTTP
+# internally — so %{HTTPS} looks "off" here even when the browser connected
+# securely. Any rule that checks %{HTTPS} directly would misfire and issue
+# a needless redirect on every request. This forces Apache to trust
+# Render's X-Forwarded-Proto header instead, so HTTPS is detected correctly.
+RewriteCond %{HTTP:X-Forwarded-Proto} https
+RewriteRule ^ - [E=HTTPS:on]
+
 # Anything under /api/ is a raw JSON endpoint hit by the mobile app —
 # never rewrite or redirect it. Without this, the "force clean URL" rule
 # below 301-redirects every request containing ".php" (including the

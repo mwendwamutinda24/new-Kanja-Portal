@@ -6,13 +6,10 @@
     <title>School Portal</title>
 </head>
 <body>
-
 <?php
 include 'conn.php';
 session_start();
-
 $error = "";
-
 if ($_SERVER["REQUEST_METHOD"] == "POST") {
     // The single form below is shared by students and staff:
     //   Students → Assessment Number + password
@@ -23,9 +20,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
     // and only fall through to Teachers if that doesn't match.
     $identifier = trim($_POST['AssesmentNumber']);
     $passcode   = trim($_POST['password']);
-
     $authenticated = false;
-
     // ── 1) Try the Student table (Assessment Number + password) ──
     $sql = "SELECT * FROM `Student` WHERE Assesment=? AND password=?";
     $stmt = $conn->prepare($sql);
@@ -36,19 +31,16 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
     if ($result && $result->num_rows > 0) {
         $authenticated = true;
         $row = $result->fetch_assoc();
-
         $_SESSION['loggedin']     = true;
         $_SESSION['username']     = $identifier;
         $_SESSION['role']         = $row['role'];
         $_SESSION['account_type'] = 'student';
-
         // Normalize the role so stray whitespace/case differences in the
         // database don't silently break the redirect. The Student table
         // stores role = 'user' for real students, 'admin' for staff
         // accounts that were historically also kept in this table, and
         // 'superadmin' for the Head of Institution.
         $role = strtolower(trim($row['role']));
-
         if ($role === 'user') {
             header("Location: StudentDashboard.php");
             exit;
@@ -62,7 +54,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             $error = "Your account role ('" . htmlspecialchars($row['role']) . "') isn't recognized. Please contact the school office.";
         }
     }
-
     // ── 2) If no student matched, try the Teachers table (Email + TSC Number) ──
     if (!$authenticated) {
         $sql2 = "SELECT * FROM `Teachers` WHERE email=? AND tscNo=?";
@@ -70,24 +61,20 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
         $stmt2->bind_param("ss", $identifier, $passcode);
         $stmt2->execute();
         $result2 = $stmt2->get_result();
-
         if ($result2 && $result2->num_rows > 0) {
             $authenticated = true;
             $row2 = $result2->fetch_assoc();
-
             $_SESSION['loggedin']     = true;
             $_SESSION['username']     = $row2['email'];
             $_SESSION['teacher_id']   = $row2['id'];
             $_SESSION['role']         = $row2['role'];
             $_SESSION['account_type'] = 'teacher';
-
             // Teachers.role is free-typed by whoever registered the staff
             // member ("teacher", "Normal", "Head of Instituion" — note the
             // typo already present in the data), so match loosely on
             // whether it mentions "head" rather than expecting one exact
             // spelling. Anything else is treated as regular teaching staff.
             $roleNorm = strtolower(trim($row2['role']));
-
             if (strpos($roleNorm, 'head') !== false) {
                 header("Location: Hoi.php");
                 exit;
@@ -97,13 +84,11 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             }
         }
     }
-
     if (!$authenticated) {
         $error = "Invalid credentials. Enter valid details.";
     }
 }
 ?>
-
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@600&family=DM+Sans:wght@400;500&display=swap');
 

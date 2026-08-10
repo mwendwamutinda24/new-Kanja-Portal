@@ -5,9 +5,15 @@ header('Access-Control-Allow-Methods: POST, OPTIONS');
 header('Access-Control-Allow-Headers: Content-Type, Authorization');
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(204); exit; }
 
-require __DIR__ . '/../conn.php';
+// FIX: this used to require conn.php as '../conn.php', which from
+// api/results/ only resolves up to api/ - but conn.php actually lives at
+// the project root, two levels up from here. auth_check.php's own
+// require of conn.php was fine (its __DIR__ is api/, one level from root),
+// but this file's own direct require needed the extra level.
+require __DIR__ . '/../../conn.php';
 require __DIR__ . '/../auth_check.php';
 require __DIR__ . '/_config.php';
+require __DIR__ . '/_input.php';
 
 mysqli_report(MYSQLI_REPORT_OFF);
 
@@ -26,10 +32,11 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     respond(['success' => false, 'message' => 'POST required'], 405);
 }
 
-$grade    = trim($_POST['grade'] ?? '');
-$term     = trim($_POST['term'] ?? '');
-$examType = trim($_POST['examType'] ?? '');
-$year     = trim($_POST['year'] ?? '');
+$input    = skp_body();
+$grade    = trim((string) ($input['grade'] ?? ''));
+$term     = trim((string) ($input['term'] ?? ''));
+$examType = trim((string) ($input['examType'] ?? ''));
+$year     = trim((string) ($input['year'] ?? ''));
 
 if ($grade === '') {
     respond(['success' => false, 'message' => 'grade is required'], 400);

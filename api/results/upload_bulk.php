@@ -5,7 +5,8 @@ header('Access-Control-Allow-Methods: POST, OPTIONS');
 header('Access-Control-Allow-Headers: Content-Type, Authorization');
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(204); exit; }
 
-require __DIR__ . '/../conn.php';
+// FIX: conn.php path corrected to '../../conn.php' (see students.php).
+require __DIR__ . '/../../conn.php';
 require __DIR__ . '/../auth_check.php';
 require __DIR__ . '/_config.php';
 require __DIR__ . '/_save.php';
@@ -27,9 +28,10 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     respond(['success' => false, 'message' => 'POST required'], 405);
 }
 
-// NOTE: this endpoint expects multipart/form-data (file upload), NOT
-// x-www-form-urlencoded - that's fine, InfinityFree's WAF issue was
-// specifically with raw JSON bodies, multipart form uploads go through.
+// NOTE: this endpoint is multipart/form-data (file upload), so it's sent
+// via a plain fetch() with FormData on the client rather than through
+// apiRequest() (which always JSON.stringifies). Fields land in $_POST as
+// usual for multipart requests, and the file lands in $_FILES.
 $grade    = trim($_POST['grade'] ?? '');
 $term     = trim($_POST['term'] ?? '');
 $examType = trim($_POST['examType'] ?? '');
@@ -132,7 +134,7 @@ while (($row = fgetcsv($handle)) !== false) {
 fclose($handle);
 
 respond([
-    'success' => count($errors) === 0,
+    'success' => true,
     'saved'   => $saved,
     'skipped' => $skipped,
     'errors'  => $errors,

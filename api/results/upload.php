@@ -5,10 +5,12 @@ header('Access-Control-Allow-Methods: POST, OPTIONS');
 header('Access-Control-Allow-Headers: Content-Type, Authorization');
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(204); exit; }
 
-require __DIR__ . '/../conn.php';
+// FIX: conn.php path corrected to '../../conn.php' (see students.php).
+require __DIR__ . '/../../conn.php';
 require __DIR__ . '/../auth_check.php';
 require __DIR__ . '/_config.php';
 require __DIR__ . '/_save.php';
+require __DIR__ . '/_input.php';
 
 mysqli_report(MYSQLI_REPORT_OFF);
 
@@ -27,17 +29,20 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     respond(['success' => false, 'message' => 'POST required'], 405);
 }
 
-// Sent as application/x-www-form-urlencoded (same fix as login.php - raw
-// JSON bodies get silently dropped by InfinityFree). Nested array shape:
-//   grade=4&term=1&examType=opener&year=2026
-//   &students[0][id]=17&students[0][marks][MATH]=78&students[0][marks][ENG]=64
-//   &students[1][id]=18&students[1][marks][MATH]=55
-// PHP parses the bracket-notation keys into $_POST['students'] automatically.
-$grade    = trim($_POST['grade'] ?? '');
-$term     = trim($_POST['term'] ?? '');
-$examType = trim($_POST['examType'] ?? '');
-$year     = trim($_POST['year'] ?? '');
-$students = $_POST['students'] ?? null;
+// Sent as JSON now (apiRequest's default). Expected shape:
+// {
+//   "grade": "4", "term": "1", "examType": "opener", "year": "2026",
+//   "students": [
+//     { "id": "17", "marks": { "MATH": "78", "ENG": "64" } },
+//     { "id": "18", "marks": { "MATH": "55" } }
+//   ]
+// }
+$input    = skp_body();
+$grade    = trim((string) ($input['grade'] ?? ''));
+$term     = trim((string) ($input['term'] ?? ''));
+$examType = trim((string) ($input['examType'] ?? ''));
+$year     = trim((string) ($input['year'] ?? ''));
+$students = $input['students'] ?? null;
 
 if ($grade === '' || $term === '' || $examType === '' || $year === '') {
     respond(['success' => false, 'message' => 'grade, term, examType and year are all required'], 400);
@@ -53,7 +58,7 @@ $skipped = 0;
 $errors  = [];
 
 foreach ($students as $entry) {
-    $studentId = trim($entry['id'] ?? '');
+    $studentId = trim((string) ($entry['id'] ?? ''));
     if ($studentId === '') continue;
 
     $marksIn = is_array($entry['marks'] ?? null) ? $entry['marks'] : [];
@@ -88,8 +93,11 @@ foreach ($students as $entry) {
     $saved++;
 }
 
+// success reflects "the request was processed", not "every row was
+// perfect" - per-row problems surface via saved/skipped/errors so the
+// client can show a partial-success message instead of a hard failure.
 respond([
-    'success' => count($errors) === 0,
+    'success' => true,
     'saved'   => $saved,
     'skipped' => $skipped,
     'errors'  => $errors,

@@ -29,8 +29,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 }
 
 require __DIR__ . '/../../conn.php';
-require __DIR__ . '/../../subjects_config.php';
-require __DIR__ . '/../../auth_check.php';
+require __DIR__ . '/../subjects_config.php';
+require __DIR__ . '/../auth_check.php';
 
 function fail($message, $code = 500) {
     http_response_code($code);

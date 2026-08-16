@@ -1,6 +1,6 @@
 <?php
 header('Content-Type: application/json');
-require __DIR__ . '/../auth_check.php';
+require __DIR__ . '/auth_check.php';
 $session = require_auth();
 echo json_encode([
     'success' => true,

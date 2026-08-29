@@ -20,14 +20,16 @@ function respond($data, $code = 200) {
 
 $session = require_auth();
 
-// ASSUMPTION: a student's own session carries their Student.id as
-// $session['studentId'] (parallel to how teacher/hoi sessions carry
-// $session['role']). If your real session shape uses a different key,
-// tell me and this one line is all that needs to change.
-if (($session['role'] ?? '') !== 'student' || empty($session['studentId'])) {
+// FIX: was checking $session['studentId'], which doesn't exist in the
+// real session shape — auth_check.php / api_sessions returns
+// ['role','user_id','identifier',...] (same as student.php / class.php),
+// with user_id being Student.id for student accounts. That mismatch made
+// empty($session['studentId']) true for every request, so every student
+// got "Not authorized." regardless of who was logged in.
+if (($session['role'] ?? '') !== 'student' || empty($session['user_id'])) {
     respond(['success' => false, 'message' => 'Not authorized.'], 403);
 }
-$studentId = (string) $session['studentId'];
+$studentId = (string) $session['user_id'];
 
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     respond(['success' => false, 'message' => 'POST required'], 405);

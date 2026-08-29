@@ -4,9 +4,16 @@ header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: POST, OPTIONS');
 header('Access-Control-Allow-Headers: Content-Type, Authorization');
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(204); exit; }
-require __DIR__ . '/../auth_check.php'; // fixed: was '/../auth_check.php' — wrong depth for /api/results/subjects.php
+
+// FIX: was missing conn.php — require_auth() needs $conn to validate the
+// bearer token, same issue that had to be fixed in upload.php/upload_bulk.php.
+// Without this, subjects.php fatals before it can respond, which breaks the
+// whole Upload Results screen since it's the first call in loadGrade().
+require __DIR__ . '/../../conn.php';
+require __DIR__ . '/../auth_check.php';
 require __DIR__ . '/_config.php';
 require __DIR__ . '/_input.php';
+
 function respond($data, $code = 200) {
     http_response_code($code);
     echo json_encode($data);

@@ -1,21 +1,25 @@
 <?php
-/**
- * Shared subject / grade-band config for the Results API.
- *
- * ASSUMPTION: This mirrors the grade-band rules described for
- * subjects_config.php (Grade 1-3 = 4 subjects /400 with SCIE relabeled
- * as "Environmental Activities", Grade 4-6 = 8 subjects /800 with no
- * Pre-Technical, Grade 7-9 = all 9 subjects /900).
- *
- * If your actual subjects_config.php differs (different codes, different
- * band cutoffs, different labels), paste it over and these functions can
- * just delegate to it instead of duplicating the rules here.
- *
- * Subject codes match the exact column names already used in
- * UploadResults.php's manual-entry form / exam2 rows (mixed case is
- * intentional - it's what's already in the DB):
- *   MATH, ENG, KISW, SCIE, sst, ca, AGRI, re, pretec
- */
+
+function skp_band_info_for_grade(int $score, int $gradeInt): array
+{
+    $isLower = $gradeInt >= 1 && $gradeInt <= 6; // 4-level bands for Grade 1-6, 8-level for 7-9
+
+    if ($isLower) {
+        if ($score >= 75) return ['code' => 'E.E', 'label' => 'Exceeding Expectation'];
+        if ($score >= 50) return ['code' => 'M.E', 'label' => 'Meeting Expectation'];
+        if ($score >= 26) return ['code' => 'A.E', 'label' => 'Approaching Expectation'];
+        return ['code' => 'B.E', 'label' => 'Below Expectation'];
+    }
+
+    if ($score >= 90) return ['code' => 'EE2', 'label' => 'Exceeding Expectation 2'];
+    if ($score >= 75) return ['code' => 'EE1', 'label' => 'Exceeding Expectation 1'];
+    if ($score >= 63) return ['code' => 'ME2', 'label' => 'Meeting Expectation 2'];
+    if ($score >= 50) return ['code' => 'ME1', 'label' => 'Meeting Expectation 1'];
+    if ($score >= 38) return ['code' => 'AE2', 'label' => 'Approaching Expectation 2'];
+    if ($score >= 26) return ['code' => 'AE1', 'label' => 'Approaching Expectation 1'];
+    if ($score >= 13) return ['code' => 'BE2', 'label' => 'Below Expectation 2'];
+    return ['code' => 'BE1', 'label' => 'Below Expectation 1'];
+}
 
 function skp_grade_band(string $grade): string
 {

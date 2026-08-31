@@ -56,6 +56,9 @@ $termInClause = "'" . implode("','", $termCandidates) . "'";
  * Build one student's { student, subjects } block from an exam2 row
  * (or an empty one if $row is null), using the same banding helper
  * results.php uses for its award pills.
+ *
+ * $studentRow uses the Student table's own column names (surname, not
+ * lastName) — normalized here so callers always get {id, name, ...}.
  */
 function skp_build_student_block(array $studentRow, ?array $row, array $subjectMap, int $gradeInt): array {
     $subjectCount = count($subjectMap);
@@ -74,10 +77,12 @@ function skp_build_student_block(array $studentRow, ?array $row, array $subjectM
         ];
     }
 
+    $lastName = $studentRow['surname'] ?? ($studentRow['lastName'] ?? '');
+
     return [
         'student' => [
             'id'         => (string) $studentRow['id'],
-            'name'       => trim($studentRow['firstName'] . ' ' . $studentRow['lastName']),
+            'name'       => trim($studentRow['firstName'] . ' ' . $lastName),
             'average'    => $row !== null ? round($total / $subjectCount, 1) : null,
             'hasResults' => $row !== null,
         ],
@@ -93,7 +98,7 @@ if ($role === 'student') {
     $studentId     = (string) $session['user_id'];
     $studentIdSafe = mysqli_real_escape_string($conn, $studentId);
 
-    $sRes = mysqli_query($conn, "SELECT id, firstName, lastName, Grade FROM Student WHERE id = '$studentIdSafe' LIMIT 1");
+    $sRes = mysqli_query($conn, "SELECT id, firstName, surname, Grade FROM Student WHERE id = '$studentIdSafe' LIMIT 1");
     if ($sRes === false || mysqli_num_rows($sRes) === 0) {
         respond(['success' => false, 'message' => 'Student record not found'], 404);
     }
@@ -107,9 +112,10 @@ if ($role === 'student') {
         respond(['success' => false, 'message' => 'No subjects configured for this grade'], 500);
     }
 
+    // exam2 uses student_id / exam_type (snake_case), not studentId / examType.
     $q = "SELECT * FROM exam2
-          WHERE studentId = '$studentIdSafe' AND grade = '$gradeSafe'
-            AND term IN ($termInClause) AND examType = '$examTypeSafe' AND year = '$yearSafe'
+          WHERE student_id = '$studentIdSafe' AND grade = '$gradeSafe'
+            AND term IN ($termInClause) AND exam_type = '$examTypeSafe' AND year = '$yearSafe'
           LIMIT 1";
     $res = mysqli_query($conn, $q);
     $row = ($res !== false && mysqli_num_rows($res) > 0) ? mysqli_fetch_assoc($res) : null;
@@ -137,18 +143,20 @@ if (count($subjectMap) === 0) {
     respond(['success' => false, 'message' => 'No subjects configured for this grade'], 500);
 }
 
-$stuRes = mysqli_query($conn, "SELECT id, firstName, lastName, Grade FROM Student WHERE Grade = '$gradeSafe' ORDER BY firstName, lastName");
+// Student.lastName doesn't exist — the column is `surname`.
+$stuRes = mysqli_query($conn, "SELECT id, firstName, surname, Grade FROM Student WHERE Grade = '$gradeSafe' ORDER BY firstName, surname");
 if ($stuRes === false) {
-    respond(['success' => false, 'message' => 'Failed to load students for this grade'], 500);
+    respond(['success' => false, 'message' => 'Failed to load students for this grade', 'debug' => mysqli_error($conn)], 500);
 }
 
 $students = [];
 while ($studentRow = mysqli_fetch_assoc($stuRes)) {
     $studentIdSafe = mysqli_real_escape_string($conn, (string) $studentRow['id']);
 
+    // exam2 uses student_id / exam_type (snake_case), not studentId / examType.
     $q = "SELECT * FROM exam2
-          WHERE studentId = '$studentIdSafe' AND grade = '$gradeSafe'
-            AND term IN ($termInClause) AND examType = '$examTypeSafe' AND year = '$yearSafe'
+          WHERE student_id = '$studentIdSafe' AND grade = '$gradeSafe'
+            AND term IN ($termInClause) AND exam_type = '$examTypeSafe' AND year = '$yearSafe'
           LIMIT 1";
     $res = mysqli_query($conn, $q);
     $row = ($res !== false && mysqli_num_rows($res) > 0) ? mysqli_fetch_assoc($res) : null;

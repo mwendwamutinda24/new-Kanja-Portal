@@ -54,8 +54,10 @@ $termInClause = "'" . implode("','", $termCandidates) . "'";
 
 /**
  * Build one student's { student, subjects } block from an exam2 row
- * (or an empty one if $row is null), using the same banding helper
- * results.php uses for its award pills.
+ * (or an empty one if $row is null), using this file's own banding
+ * helper (skp_band_info_for_grade, in _config.php) — NOT the
+ * differently-named bandInfoForGrade() that lives locally inside
+ * results.php (the web app); the two are unrelated functions.
  *
  * $studentRow uses the Student table's own column names (surname, not
  * lastName) — normalized here so callers always get {id, name, ...}.
@@ -68,7 +70,7 @@ function skp_build_student_block(array $studentRow, ?array $row, array $subjectM
     foreach ($subjectMap as $s) {
         $score  = $row !== null ? (int) ($row[$s['code']] ?? 0) : 0;
         $total += $score;
-        $band   = bandInfoForGrade($score, $gradeInt);
+        $band   = skp_band_info_for_grade($score, $gradeInt);
         $subjects[] = [
             'subject' => $s['label'],
             'score'   => $score,

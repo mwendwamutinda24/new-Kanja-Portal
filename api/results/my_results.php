@@ -18,35 +18,18 @@ function respond($data, $code = 200) {
     exit;
 }
 
-$session = require_auth();
-
-$role = $session['role'] ?? '';
-$input = null; // may get set early below for the staff-lookup path
-
-if ($role === 'student') {
-    // Students can only ever see their own record.
-    if (empty($session['user_id'])) {
-        respond(['success' => false, 'message' => 'Not authorized.'], 403);
-    }
-    $studentId = (string) $session['user_id'];
-} elseif ($role === 'teacher' || $role === 'Head of Instituion') {
-    // Staff lookup: must specify which student's results to pull.
-    // Read the body early here so we can grab studentId before the
-    // rest of term/examType/year parsing below.
-    $input = skp_body();
-    $studentId = trim((string) ($input['studentId'] ?? ''));
-    if ($studentId === '') {
-        respond(['success' => false, 'message' => 'studentId is required for staff lookups.'], 400);
-    }
-} else {
-    respond(['success' => false, 'message' => 'Not authorized.'], 403);
-}
-
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     respond(['success' => false, 'message' => 'POST required'], 405);
 }
 
-$input    = $input ?? skp_body();
+$session = require_auth();
+$role    = $session['role'] ?? '';
+
+if (!in_array($role, ['student', 'teacher', 'Head of Instituion'], true)) {
+    respond(['success' => false, 'message' => 'Not authorized.'], 403);
+}
+
+$input    = skp_body();
 $term     = trim((string) ($input['term'] ?? ''));      // expects "1"/"2"/"3"
 $examType = trim((string) ($input['examType'] ?? ''));  // expects opener/midterm/endterm
 $year     = trim((string) ($input['year'] ?? ''));
@@ -55,71 +38,126 @@ if ($term === '' || $examType === '' || $year === '') {
     respond(['success' => false, 'message' => 'term, examType and year are all required'], 400);
 }
 
-// Pull grade + name from the Student row itself rather than trusting a
-// client-supplied grade — a student should only ever see their own
-// record, and staff should only get back whatever grade that student
-// row actually has, never one typed in separately.
-$studentIdSafe = mysqli_real_escape_string($conn, $studentId);
-$sRes = mysqli_query($conn, "SELECT id, firstName, lastName, Grade FROM Student WHERE id = '$studentIdSafe' LIMIT 1");
-if ($sRes === false || mysqli_num_rows($sRes) === 0) {
-    respond(['success' => false, 'message' => 'Student record not found'], 404);
-}
-$studentRow = mysqli_fetch_assoc($sRes);
-$grade      = (string) $studentRow['Grade'];
-$gradeInt   = (int) $grade;
-
-$subjectMap = skp_subjects_for_grade($grade); // [{code,label}, ...]
-if (count($subjectMap) === 0) {
-    respond(['success' => false, 'message' => 'No subjects configured for this grade'], 500);
-}
-$subjectCount = count($subjectMap);
-
 $termSafe     = mysqli_real_escape_string($conn, $term);
 $examTypeSafe = mysqli_real_escape_string($conn, $examType);
 $yearSafe     = mysqli_real_escape_string($conn, $year);
-$gradeSafe    = mysqli_real_escape_string($conn, $grade);
 
 // WORKAROUND: exam2.term has been written in at least two formats — bare
 // digits ("1") from the mobile upload endpoints, and "Term 1" style
 // strings from the older web upload flow (see the note in results.php).
-// Match either, so a student sees their marks regardless of which flow
-// saved them.
+// Match either, so results show up regardless of which flow saved them.
 $termCandidates = [$termSafe];
 if (ctype_digit($term)) {
     $termCandidates[] = 'Term ' . $termSafe;
 }
 $termInClause = "'" . implode("','", $termCandidates) . "'";
 
-$q = "SELECT * FROM exam2
-      WHERE studentId = '$studentIdSafe' AND grade = '$gradeSafe'
-        AND term IN ($termInClause) AND examType = '$examTypeSafe' AND year = '$yearSafe'
-      LIMIT 1";
-$res = mysqli_query($conn, $q);
-if ($res === false || mysqli_num_rows($res) === 0) {
-    respond(['success' => true, 'student' => null, 'subjects' => []]);
-}
-$row = mysqli_fetch_assoc($res);
+/**
+ * Build one student's { student, subjects } block from an exam2 row
+ * (or an empty one if $row is null), using the same banding helper
+ * results.php uses for its award pills.
+ */
+function skp_build_student_block(array $studentRow, ?array $row, array $subjectMap, int $gradeInt): array {
+    $subjectCount = count($subjectMap);
+    $subjects     = [];
+    $total        = 0;
 
-$subjects = [];
-$total    = 0;
-foreach ($subjectMap as $s) {
-    $score  = (int) ($row[$s['code']] ?? 0);
-    $total += $score;
-    $band   = bandInfoForGrade($score, $gradeInt); // same helper results.php uses for its award pills
-    $subjects[] = [
-        'subject' => $s['label'],
-        'score'   => $score,
-        'grade'   => $band['code'],   // e.g. "E.E" / "EE1"
-        'remarks' => $band['label'],  // e.g. "Exceeding Expectation"
+    foreach ($subjectMap as $s) {
+        $score  = $row !== null ? (int) ($row[$s['code']] ?? 0) : 0;
+        $total += $score;
+        $band   = bandInfoForGrade($score, $gradeInt);
+        $subjects[] = [
+            'subject' => $s['label'],
+            'score'   => $score,
+            'grade'   => $band['code'],
+            'remarks' => $band['label'],
+        ];
+    }
+
+    return [
+        'student' => [
+            'id'         => (string) $studentRow['id'],
+            'name'       => trim($studentRow['firstName'] . ' ' . $studentRow['lastName']),
+            'average'    => $row !== null ? round($total / $subjectCount, 1) : null,
+            'hasResults' => $row !== null,
+        ],
+        'subjects' => $subjects,
     ];
 }
-$average = round($total / $subjectCount, 1);
+
+if ($role === 'student') {
+    // Students only ever see their own record.
+    if (empty($session['user_id'])) {
+        respond(['success' => false, 'message' => 'Not authorized.'], 403);
+    }
+    $studentId     = (string) $session['user_id'];
+    $studentIdSafe = mysqli_real_escape_string($conn, $studentId);
+
+    $sRes = mysqli_query($conn, "SELECT id, firstName, lastName, Grade FROM Student WHERE id = '$studentIdSafe' LIMIT 1");
+    if ($sRes === false || mysqli_num_rows($sRes) === 0) {
+        respond(['success' => false, 'message' => 'Student record not found'], 404);
+    }
+    $studentRow = mysqli_fetch_assoc($sRes);
+    $grade      = (string) $studentRow['Grade'];
+    $gradeInt   = (int) $grade;
+    $gradeSafe  = mysqli_real_escape_string($conn, $grade);
+
+    $subjectMap = skp_subjects_for_grade($grade);
+    if (count($subjectMap) === 0) {
+        respond(['success' => false, 'message' => 'No subjects configured for this grade'], 500);
+    }
+
+    $q = "SELECT * FROM exam2
+          WHERE studentId = '$studentIdSafe' AND grade = '$gradeSafe'
+            AND term IN ($termInClause) AND examType = '$examTypeSafe' AND year = '$yearSafe'
+          LIMIT 1";
+    $res = mysqli_query($conn, $q);
+    $row = ($res !== false && mysqli_num_rows($res) > 0) ? mysqli_fetch_assoc($res) : null;
+
+    $block = skp_build_student_block($studentRow, $row, $subjectMap, $gradeInt);
+    respond([
+        'success'  => true,
+        'student'  => $block['student'],
+        'subjects' => $block['subjects'],
+    ]);
+}
+
+// Staff (teacher / Head of Instituion): return every learner in the
+// selected grade, each with their own subjects/average — this is the
+// "whole class" transcript view, not a single-student lookup.
+$grade = trim((string) ($input['grade'] ?? ''));
+if ($grade === '') {
+    respond(['success' => false, 'message' => 'grade is required for staff lookups.'], 400);
+}
+$gradeInt  = (int) $grade;
+$gradeSafe = mysqli_real_escape_string($conn, $grade);
+
+$subjectMap = skp_subjects_for_grade($grade);
+if (count($subjectMap) === 0) {
+    respond(['success' => false, 'message' => 'No subjects configured for this grade'], 500);
+}
+
+$stuRes = mysqli_query($conn, "SELECT id, firstName, lastName, Grade FROM Student WHERE Grade = '$gradeSafe' ORDER BY firstName, lastName");
+if ($stuRes === false) {
+    respond(['success' => false, 'message' => 'Failed to load students for this grade'], 500);
+}
+
+$students = [];
+while ($studentRow = mysqli_fetch_assoc($stuRes)) {
+    $studentIdSafe = mysqli_real_escape_string($conn, (string) $studentRow['id']);
+
+    $q = "SELECT * FROM exam2
+          WHERE studentId = '$studentIdSafe' AND grade = '$gradeSafe'
+            AND term IN ($termInClause) AND examType = '$examTypeSafe' AND year = '$yearSafe'
+          LIMIT 1";
+    $res = mysqli_query($conn, $q);
+    $row = ($res !== false && mysqli_num_rows($res) > 0) ? mysqli_fetch_assoc($res) : null;
+
+    $students[] = skp_build_student_block($studentRow, $row, $subjectMap, $gradeInt);
+}
 
 respond([
-    'success' => true,
-    'student' => [
-        'name'    => trim($studentRow['firstName'] . ' ' . $studentRow['lastName']),
-        'average' => $average,
-    ],
-    'subjects' => $subjects,
+    'success'  => true,
+    'grade'    => $grade,
+    'students' => $students,
 ]);

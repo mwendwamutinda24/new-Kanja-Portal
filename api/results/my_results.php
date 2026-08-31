@@ -20,22 +20,33 @@ function respond($data, $code = 200) {
 
 $session = require_auth();
 
-// FIX: was checking $session['studentId'], which doesn't exist in the
-// real session shape — auth_check.php / api_sessions returns
-// ['role','user_id','identifier',...] (same as student.php / class.php),
-// with user_id being Student.id for student accounts. That mismatch made
-// empty($session['studentId']) true for every request, so every student
-// got "Not authorized." regardless of who was logged in.
-if (($session['role'] ?? '') !== 'student' || empty($session['user_id'])) {
+$role = $session['role'] ?? '';
+$input = null; // may get set early below for the staff-lookup path
+
+if ($role === 'student') {
+    // Students can only ever see their own record.
+    if (empty($session['user_id'])) {
+        respond(['success' => false, 'message' => 'Not authorized.'], 403);
+    }
+    $studentId = (string) $session['user_id'];
+} elseif ($role === 'teacher' || $role === 'Head of Instituion') {
+    // Staff lookup: must specify which student's results to pull.
+    // Read the body early here so we can grab studentId before the
+    // rest of term/examType/year parsing below.
+    $input = skp_body();
+    $studentId = trim((string) ($input['studentId'] ?? ''));
+    if ($studentId === '') {
+        respond(['success' => false, 'message' => 'studentId is required for staff lookups.'], 400);
+    }
+} else {
     respond(['success' => false, 'message' => 'Not authorized.'], 403);
 }
-$studentId = (string) $session['user_id'];
 
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     respond(['success' => false, 'message' => 'POST required'], 405);
 }
 
-$input    = skp_body();
+$input    = $input ?? skp_body();
 $term     = trim((string) ($input['term'] ?? ''));      // expects "1"/"2"/"3"
 $examType = trim((string) ($input['examType'] ?? ''));  // expects opener/midterm/endterm
 $year     = trim((string) ($input['year'] ?? ''));
@@ -45,8 +56,9 @@ if ($term === '' || $examType === '' || $year === '') {
 }
 
 // Pull grade + name from the Student row itself rather than trusting a
-// client-supplied grade — a student should only ever be able to see their
-// own record, never one they typed in.
+// client-supplied grade — a student should only ever see their own
+// record, and staff should only get back whatever grade that student
+// row actually has, never one typed in separately.
 $studentIdSafe = mysqli_real_escape_string($conn, $studentId);
 $sRes = mysqli_query($conn, "SELECT id, firstName, lastName, Grade FROM Student WHERE id = '$studentIdSafe' LIMIT 1");
 if ($sRes === false || mysqli_num_rows($sRes) === 0) {

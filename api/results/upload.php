@@ -1,43 +1,48 @@
 <?php
-/**
- * POST /results/upload.php
- * Body: {
- *   grade: "5", term: "1", examType: "opener", year: "2026",
- *   students: [ { id: "123", marks: { MATH: "78", ENG: "65", ... } }, ... ]
- * }
- *
- * Mirrors the web app's manual-entry save behaviour:
- *   - a student with NO marks in the payload (all blank) is skipped
- *     entirely, not saved as a zeroed-out row
- *   - one exam2 row per student/grade/term/examType/year — UPDATE if
- *     it already exists, INSERT if not (never a blind duplicate INSERT)
- *
- * The client already filters out deselected learners and blank marks
- * before sending (see submitManual() in UploadResults.tsx), but this
- * endpoint re-validates rather than trusting that, since it's a
- * public API surface.
- *
- * Response: { success, saved, skipped, errors: string[] }
- */
+header('Content-Type: application/json');
+header('Access-Control-Allow-Origin: *');
+header('Access-Control-Allow-Methods: POST, OPTIONS');
+header('Access-Control-Allow-Headers: Content-Type, Authorization');
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(204); exit; }
 
-require_once __DIR__ . '/_bootstrap.php';
+require __DIR__ . '/../../conn.php';
+require __DIR__ . '/../auth_check.php';
+require __DIR__ . '/_config.php';
+require __DIR__ . '/_input.php';
 
-$grade    = requireField($BODY, 'grade');
-$term     = requireField($BODY, 'term');
-$examType = requireField($BODY, 'examType');
-$year     = requireField($BODY, 'year');
-$students = $BODY['students'] ?? null;
+function respond($data, $code = 200) {
+    http_response_code($code);
+    echo json_encode($data);
+    exit;
+}
+
+$session = require_auth();
+if (!in_array($session['role'], ['teacher', 'hoi'], true)) {
+    respond(['success' => false, 'message' => 'Not authorized.'], 403);
+}
+
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    respond(['success' => false, 'message' => 'POST required'], 405);
+}
+
+$input = skp_body();
+
+$grade    = trim((string) ($input['grade'] ?? ''));
+$term     = trim((string) ($input['term'] ?? ''));
+$examType = trim((string) ($input['examType'] ?? ''));
+$year     = trim((string) ($input['year'] ?? ''));
+$students = $input['students'] ?? null;
+
+if ($grade === '' || $term === '' || $examType === '' || $year === '') {
+    respond(['success' => false, 'message' => 'grade, term, examType and year are all required'], 400);
+}
 
 if (!is_array($students) || count($students) === 0) {
-    json_error('No students provided', 422);
+    respond(['success' => false, 'message' => 'No students provided'], 422);
 }
 
-if (!ctype_digit($grade) || (int)$grade < 1 || (int)$grade > 9) {
-    json_error('Invalid grade', 422);
-}
-
-$subjects = getSubjectsForGrade((int)$grade); // CONFIRM: see subjects.php note
-$validCodes = array_map(fn($s) => $s['code'], $subjects);
+$subjects = skp_subjects_for_grade($grade);
+$validCodes = array_column($subjects, 'code');
 
 $gradeSafe    = mysqli_real_escape_string($conn, $grade);
 $termSafe     = mysqli_real_escape_string($conn, $term);
@@ -49,7 +54,7 @@ $skipped = 0;
 $errors = [];
 
 foreach ($students as $entry) {
-    $studentId = isset($entry['id']) ? (string)$entry['id'] : '';
+    $studentId = isset($entry['id']) ? (string) $entry['id'] : '';
     $marksIn   = is_array($entry['marks'] ?? null) ? $entry['marks'] : [];
 
     if ($studentId === '') {
@@ -58,8 +63,9 @@ foreach ($students as $entry) {
         continue;
     }
 
-    // Only keep known subject codes with a genuinely non-blank value —
-    // same "skip if all blank" rule as the web app.
+    // Only keep known subject codes with a genuinely non-blank value — a
+    // student with all-blank marks is skipped entirely, not saved as a
+    // zeroed-out row, same as the web app's manual-entry behaviour.
     $marks = [];
     foreach ($marksIn as $code => $val) {
         if (!in_array($code, $validCodes, true)) continue;
@@ -68,7 +74,7 @@ foreach ($students as $entry) {
             $errors[] = "Invalid mark for student $studentId, subject $code: $val";
             continue;
         }
-        $marks[$code] = (int)$val;
+        $marks[$code] = (int) $val;
     }
 
     if (count($marks) === 0) {
@@ -87,8 +93,8 @@ foreach ($students as $entry) {
         continue;
     }
 
-    // CONFIRM: column names (studentId, examTerm, examType, examYear)
-    // — adjust to match the real exam2 schema, same as students.php.
+    // CONFIRM: column names (studentId, examTerm, examType, examYear) —
+    // adjust to match the real exam2 schema once shared.
     $existing = mysqli_query($conn, "
         SELECT id FROM exam2
         WHERE studentId = '$studentIdSafe'
@@ -105,15 +111,15 @@ foreach ($students as $entry) {
     }
 
     if (mysqli_num_rows($existing) > 0) {
-        // UPDATE only the subject columns that were actually submitted,
-        // so subjects not in this payload keep whatever was there before.
+        // UPDATE only the subject columns actually submitted, so subjects
+        // not in this payload keep whatever was there before.
         $setParts = [];
         foreach ($marks as $code => $val) {
             $setParts[] = "`$code` = $val";
         }
         $setSql = implode(', ', $setParts);
         $row = mysqli_fetch_assoc($existing);
-        $examId = (int)$row['id'];
+        $examId = (int) $row['id'];
 
         $ok = mysqli_query($conn, "UPDATE exam2 SET $setSql WHERE id = $examId");
     } else {
@@ -136,7 +142,8 @@ foreach ($students as $entry) {
     }
 }
 
-json_ok([
+respond([
+    'success' => true,
     'saved'   => $saved,
     'skipped' => $skipped,
     'errors'  => $errors,

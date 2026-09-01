@@ -1,67 +1,66 @@
 <?php
-/**
- * POST /results/upload_bulk.php
- * multipart/form-data:
- *   grade, term, examType, year   (text fields)
- *   marksFile                     (the completed .csv, from
- *                                  generate_template.php's CSV output)
- *
- * Note: the mobile app only offers CSV (see openTemplateDownload() in
- * UploadResults.tsx, which links straight to generate_template.php on
- * the web host and the "helperText" telling users to keep it as .csv).
- * The web app additionally supports .xlsx uploads via PhpSpreadsheet —
- * if you want that here too, reuse the same PhpSpreadsheet autoloader
- * mentioned in your notes rather than duplicating parsing logic.
- *
- * Matching rule (same as the web app's bulk upload): match each row to
- * a student PRIMARILY by First Name + Surname within the selected
- * grade; Assessment No is only used to break a tie between two
- * same-named learners in that grade. Existing exam2 rows for that
- * student/term/year/examType are updated in place; otherwise a new row
- * is created. Never a blind duplicate INSERT.
- *
- * Response: { success, saved, skipped, errors: string[] }
- */
+header('Content-Type: application/json');
+header('Access-Control-Allow-Origin: *');
+header('Access-Control-Allow-Methods: POST, OPTIONS');
+header('Access-Control-Allow-Headers: Content-Type, Authorization');
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(204); exit; }
 
-require_once __DIR__ . '/_bootstrap.php';
+require __DIR__ . '/../../conn.php';
+require __DIR__ . '/../auth_check.php';
+require __DIR__ . '/_config.php';
+// NOTE: this endpoint is multipart/form-data (it carries a file), so text
+// fields are read straight from $_POST rather than through skp_body() —
+// _input.php isn't required here for that reason. If skp_body() already
+// falls back to $_POST for non-JSON requests, requiring it and calling it
+// would work too; left out to avoid assuming that behaviour.
 
-// This endpoint receives multipart/form-data, so text fields land in
-// $_POST directly (readBody() in _bootstrap.php already falls back to
-// $_POST when the body isn't JSON, but be explicit here since a file
-// is involved).
-$grade    = requireField($_POST, 'grade');
-$term     = requireField($_POST, 'term');
-$examType = requireField($_POST, 'examType');
-$year     = requireField($_POST, 'year');
+function respond($data, $code = 200) {
+    http_response_code($code);
+    echo json_encode($data);
+    exit;
+}
 
-if (!ctype_digit($grade) || (int)$grade < 1 || (int)$grade > 9) {
-    json_error('Invalid grade', 422);
+$session = require_auth();
+if (!in_array($session['role'], ['teacher', 'hoi'], true)) {
+    respond(['success' => false, 'message' => 'Not authorized.'], 403);
+}
+
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    respond(['success' => false, 'message' => 'POST required'], 405);
+}
+
+$grade    = trim((string) ($_POST['grade'] ?? ''));
+$term     = trim((string) ($_POST['term'] ?? ''));
+$examType = trim((string) ($_POST['examType'] ?? ''));
+$year     = trim((string) ($_POST['year'] ?? ''));
+
+if ($grade === '' || $term === '' || $examType === '' || $year === '') {
+    respond(['success' => false, 'message' => 'grade, term, examType and year are all required'], 400);
 }
 
 if (!isset($_FILES['marksFile']) || $_FILES['marksFile']['error'] !== UPLOAD_ERR_OK) {
-    json_error('No file was uploaded', 422);
+    respond(['success' => false, 'message' => 'No file was uploaded'], 422);
 }
 
-$tmpPath = $_FILES['marksFile']['tmp_name'];
+$tmpPath  = $_FILES['marksFile']['tmp_name'];
 $origName = $_FILES['marksFile']['name'];
 
 if (!preg_match('/\.csv$/i', $origName)) {
-    json_error('Only .csv files are supported by this endpoint', 422);
+    respond(['success' => false, 'message' => 'Only .csv files are supported by this endpoint'], 422);
 }
 
 $handle = fopen($tmpPath, 'r');
 if ($handle === false) {
-    json_error('Could not read uploaded file', 500);
+    respond(['success' => false, 'message' => 'Could not read uploaded file'], 500);
 }
 
 $header = fgetcsv($handle);
 if ($header === false) {
     fclose($handle);
-    json_error('CSV file is empty', 422);
+    respond(['success' => false, 'message' => 'CSV file is empty'], 422);
 }
 
-// Normalize header names for matching: trim + lowercase.
-$normHeader = array_map(fn($h) => strtolower(trim((string)$h)), $header);
+$normHeader = array_map(fn($h) => strtolower(trim((string) $h)), $header);
 
 $colIndex = function (array $candidates) use ($normHeader): ?int {
     foreach ($candidates as $cand) {
@@ -77,15 +76,14 @@ $assessIdx    = $colIndex(['assess. no', 'assessment no', 'assesment', 'assess n
 
 if ($firstNameIdx === null || $surnameIdx === null) {
     fclose($handle);
-    json_error('CSV must include First Name and Surname columns', 422);
+    respond(['success' => false, 'message' => 'CSV must include First Name and Surname columns'], 422);
 }
 
-$subjects = getSubjectsForGrade((int)$grade); // CONFIRM: see subjects.php note
-$validCodes = array_map(fn($s) => $s['code'], $subjects);
+$subjects = skp_subjects_for_grade($grade);
 
-// Map each subject code to whichever CSV column matches it (by code
-// or by label, case-insensitively) — the template's header naming may
-// use either depending on how generate_template.php labels columns.
+// Map each subject code to whichever CSV column matches it (by code or by
+// label, case-insensitively) — the template's header naming may use
+// either depending on how generate_template.php labels columns.
 $subjectColIdx = [];
 foreach ($subjects as $subj) {
     $idx = $colIndex([strtolower($subj['code']), strtolower($subj['label'])]);
@@ -94,11 +92,11 @@ foreach ($subjects as $subj) {
 
 if (count($subjectColIdx) === 0) {
     fclose($handle);
-    json_error('CSV has no recognizable subject columns for this grade', 422);
+    respond(['success' => false, 'message' => 'CSV has no recognizable subject columns for this grade'], 422);
 }
 
-// ── Load this grade's roster, grouped by "firstname|surname" so we
-// can detect same-name collisions and fall back to Assessment No. ──
+// Load this grade's roster, grouped by "firstname|surname" so we can
+// detect same-name collisions and fall back to Assessment No.
 $gradeSafe = mysqli_real_escape_string($conn, $grade);
 $rosterRes = mysqli_query($conn, "
     SELECT id, Assesment, firstName, surname
@@ -107,7 +105,7 @@ $rosterRes = mysqli_query($conn, "
 ");
 if ($rosterRes === false) {
     fclose($handle);
-    json_error('Database error loading roster: ' . mysqli_error($conn), 500);
+    respond(['success' => false, 'message' => 'Database error loading roster: ' . mysqli_error($conn)], 500);
 }
 
 $byName = []; // 'firstname|surname' (lowercase, trimmed) => [ student rows ]
@@ -128,12 +126,11 @@ $rowNum = 1; // header was row 0
 while (($line = fgetcsv($handle)) !== false) {
     $rowNum++;
 
-    // Skip fully blank trailing lines some spreadsheet apps leave in.
-    if (count(array_filter($line, fn($c) => trim((string)$c) !== '')) === 0) continue;
+    if (count(array_filter($line, fn($c) => trim((string) $c) !== '')) === 0) continue;
 
-    $firstName = trim((string)($line[$firstNameIdx] ?? ''));
-    $surname   = trim((string)($line[$surnameIdx] ?? ''));
-    $assess    = $assessIdx !== null ? trim((string)($line[$assessIdx] ?? '')) : '';
+    $firstName = trim((string) ($line[$firstNameIdx] ?? ''));
+    $surname   = trim((string) ($line[$surnameIdx] ?? ''));
+    $assess    = $assessIdx !== null ? trim((string) ($line[$assessIdx] ?? '')) : '';
 
     if ($firstName === '' || $surname === '') {
         $errors[] = "Row $rowNum: missing First Name or Surname, skipped";
@@ -148,9 +145,8 @@ while (($line = fgetcsv($handle)) !== false) {
     if (count($candidates) === 1) {
         $student = $candidates[0];
     } elseif (count($candidates) > 1) {
-        // Tie-break by Assessment No.
         foreach ($candidates as $cand) {
-            if ($assess !== '' && (string)$cand['Assesment'] === $assess) {
+            if ($assess !== '' && (string) $cand['Assesment'] === $assess) {
                 $student = $cand;
                 break;
             }
@@ -168,13 +164,13 @@ while (($line = fgetcsv($handle)) !== false) {
 
     $marks = [];
     foreach ($subjectColIdx as $code => $idx) {
-        $val = trim((string)($line[$idx] ?? ''));
+        $val = trim((string) ($line[$idx] ?? ''));
         if ($val === '') continue;
         if (!is_numeric($val) || $val < 0 || $val > 100) {
             $errors[] = "Row $rowNum ($firstName $surname): invalid mark \"$val\" for $code, skipped that subject";
             continue;
         }
-        $marks[$code] = (int)$val;
+        $marks[$code] = (int) $val;
     }
 
     if (count($marks) === 0) {
@@ -184,8 +180,8 @@ while (($line = fgetcsv($handle)) !== false) {
 
     $studentIdSafe = mysqli_real_escape_string($conn, $student['id']);
 
-    // CONFIRM: column names (studentId, examTerm, examType, examYear)
-    // — same schema assumption as upload.php / students.php.
+    // CONFIRM: column names (studentId, examTerm, examType, examYear) —
+    // same schema assumption as upload.php / students.php.
     $existing = mysqli_query($conn, "
         SELECT id FROM exam2
         WHERE studentId = '$studentIdSafe'
@@ -208,7 +204,7 @@ while (($line = fgetcsv($handle)) !== false) {
         }
         $setSql = implode(', ', $setParts);
         $row = mysqli_fetch_assoc($existing);
-        $examId = (int)$row['id'];
+        $examId = (int) $row['id'];
 
         $ok = mysqli_query($conn, "UPDATE exam2 SET $setSql WHERE id = $examId");
     } else {
@@ -233,7 +229,8 @@ while (($line = fgetcsv($handle)) !== false) {
 
 fclose($handle);
 
-json_ok([
+respond([
+    'success' => true,
     'saved'   => $saved,
     'skipped' => $skipped,
     'errors'  => $errors,

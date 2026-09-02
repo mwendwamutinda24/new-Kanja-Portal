@@ -4,7 +4,8 @@
  *
  * Mobile (Kanja Portal) endpoint for the "Register Teacher" screen.
  * Only an HOI / Deputy HOI can register a teacher.
- * Accepts JSON body OR form-urlencoded, auth'd via Bearer token, returns JSON.
+ * Auth'd via Bearer token, returns the standard { ok, ... } / { ok:false, error, message }
+ * envelope used by every api/*.php endpoint (see api/helpers/response.php).
  */
 
 header('Content-Type: application/json');
@@ -13,20 +14,27 @@ mysqli_report(MYSQLI_REPORT_OFF);
 include 'conn.php';
 include 'auth.php'; // <-- adjust to wherever your existing verifyToken()/Bearer-auth helper lives
 
-function respond(int $status, array $body): void {
+// Swap for api/helpers/response.php's respondOk()/respondError() if that's where
+// the shared envelope actually lives — same note as in register_student.php.
+function respondOk(array $data = [], int $status = 200): void {
     http_response_code($status);
-    echo json_encode($body);
+    echo json_encode(array_merge(['ok' => true], $data));
+    exit;
+}
+function respondError(string $message, int $status = 400, string $error = 'error'): void {
+    http_response_code($status);
+    echo json_encode(['ok' => false, 'error' => $error, 'message' => $message]);
     exit;
 }
 
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
-    respond(405, ['success' => false, 'error' => 'Method not allowed']);
+    respondError('Method not allowed', 405, 'method_not_allowed');
 }
 
 /* ---- Auth ---- */
 $authHeader = $_SERVER['HTTP_AUTHORIZATION'] ?? ($_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '');
 if (!preg_match('/Bearer\s+(\S+)/i', $authHeader, $m)) {
-    respond(401, ['success' => false, 'error' => 'Missing bearer token']);
+    respondError('Missing bearer token', 401, 'no_token');
 }
 $token = $m[1];
 
@@ -34,21 +42,18 @@ $token = $m[1];
 // (token, user_id, role, expires_at) shared with subjects.php / students.php.
 $user = verifyToken($conn, $token);
 if (!$user) {
-    respond(401, ['success' => false, 'error' => 'Invalid or expired token']);
+    respondError('Invalid or expired token', 401, 'invalid_token');
 }
 // Only Head of Institution / Deputy can register teachers.
 if (!in_array($user['role'], ['hoi', 'Dhoi'], true)) {
-    respond(403, ['success' => false, 'error' => 'Not authorized to register teachers']);
+    respondError('Not authorized to register teachers', 403, 'forbidden');
 }
 
-/* ---- Accept JSON or form-urlencoded body ---- */
-$input = $_POST;
-if (empty($input)) {
-    $raw = file_get_contents('php://input');
-    $decoded = json_decode($raw, true);
-    if (is_array($decoded)) {
-        $input = $decoded;
-    }
+/* ---- Body: apiRequest() always sends JSON when auth=true ---- */
+$raw = file_get_contents('php://input');
+$input = json_decode($raw, true);
+if (!is_array($input)) {
+    $input = $_POST; // fallback for form-urlencoded callers
 }
 
 $name    = trim($input['name'] ?? '');
@@ -65,19 +70,19 @@ $subject = trim($input['subject'] ?? ''); // optional
 $allowedRoles = ['hoi', 'Dhoi', 'Senior', 'teacher'];
 
 if ($name === '' || $email === '' || $phone === '' || $role === '') {
-    respond(422, ['success' => false, 'error' => 'name, email, phone and role are required']);
+    respondError('name, email, phone and role are required', 422, 'validation_error');
 }
 if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
-    respond(422, ['success' => false, 'error' => 'Invalid email address']);
+    respondError('Invalid email address', 422, 'validation_error');
 }
 if (!preg_match('/^0\d{9}$/', $phone)) {
-    respond(422, ['success' => false, 'error' => 'Phone must be a 10-digit number starting with 0']);
+    respondError('Phone must be a 10-digit number starting with 0', 422, 'validation_error');
 }
 if (!in_array($role, $allowedRoles, true)) {
-    respond(422, ['success' => false, 'error' => 'Invalid role']);
+    respondError('Invalid role', 422, 'validation_error');
 }
 if ($tsc !== '' && !ctype_digit($tsc)) {
-    respond(422, ['success' => false, 'error' => 'TSC number must be numeric']);
+    respondError('TSC number must be numeric', 422, 'validation_error');
 }
 
 /* ---- Duplicate email check ---- */
@@ -86,7 +91,7 @@ $check->bind_param('s', $email);
 $check->execute();
 if ($check->get_result()->num_rows > 0) {
     $check->close();
-    respond(409, ['success' => false, 'error' => 'A teacher with this email already exists']);
+    respondError('A teacher with this email already exists', 409, 'duplicate_email');
 }
 $check->close();
 
@@ -97,7 +102,7 @@ $stmt = $conn->prepare(
 );
 if (!$stmt) {
     error_log('register_teacher.php prepare failed: ' . $conn->error);
-    respond(500, ['success' => false, 'error' => 'Server error']);
+    respondError('Server error', 500, 'server_error');
 }
 
 $tscValue   = $tsc !== '' ? $tsc : null;
@@ -113,14 +118,10 @@ if ($stmt->execute()) {
     $newId = $stmt->insert_id;
     $stmt->close();
     $conn->close();
-    respond(201, [
-        'success'   => true,
-        'teacherId' => $newId,
-        'name'      => $name,
-    ]);
+    respondOk(['teacherId' => $newId, 'name' => $name], 201);
 } else {
     error_log('register_teacher.php insert failed: ' . $stmt->error);
     $stmt->close();
     $conn->close();
-    respond(500, ['success' => false, 'error' => 'Insert failed']);
+    respondError('Insert failed', 500, 'insert_failed');
 }

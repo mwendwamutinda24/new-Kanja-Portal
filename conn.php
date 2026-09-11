@@ -3,6 +3,10 @@ mysqli_report(MYSQLI_REPORT_OFF);
 
 $caCertPath = __DIR__ . '/ca.pem'; // adjust path to wherever you upload it
 
+// --- DIAGNOSTIC: confirm ca.pem is actually present on the deployed server ---
+error_log('ca.pem exists: ' . (file_exists($caCertPath) ? 'yes' : 'NO - MISSING') . ' at ' . $caCertPath);
+// --- remove this line once you've confirmed the answer in the logs ---
+
 $dbHost = getenv('DB_HOST') ?: 'mysql-12cba62a-mwendwamutinda24-ae64.a.aivencloud.com';
 $dbUser = getenv('DB_USER') ?: 'avnadmin';
 $dbPass = getenv('DB_PASS'); // no hardcoded fallback — see note below

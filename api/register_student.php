@@ -1,6 +1,17 @@
 <?php
+/**
+ * POST /api/register_student.php
+ *
+ * Mobile (Kanja Portal) endpoint for the "Admit New Learner" screen.
+ * Accepts JSON body, auth'd via Bearer token, returns the standard
+ * { ok: true, ... } / { ok: false, error, message } envelope used by
+ * this screen.
+ *
+ * Matches the same rule as bulk_register.php: only firstName is required,
+ * everything else can be filled in later on the Students page.
+ */
 
-header('Access-Control-Allow-Origin: *'); // or your specific origin(s)
+header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: POST, OPTIONS');
 header('Access-Control-Allow-Headers: Content-Type, Authorization');
 
@@ -8,27 +19,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     http_response_code(204);
     exit;
 }
-/**
- * POST /api/register_student.php
- *
- * Mobile (Kanja Portal) endpoint for the "Admit New Learner" screen.
- * Accepts JSON body, auth'd via Bearer token, returns the standard
- * { ok: true, ... } / { ok: false, error, message } envelope used by
- * every api/*.php endpoint (see api/helpers/response.php).
- *
- * Matches the same rule as bulk_register.php: only firstName is required,
- * everything else can be filled in later on the Students page.
- */
 
 header('Content-Type: application/json');
 mysqli_report(MYSQLI_REPORT_OFF); // don't let a failed query throw; we handle errors ourselves
 
-include '../conn.php';
-include 'auth_check.php'; // <-- adjust to wherever your existing verifyToken()/Bearer-auth helper lives
+require __DIR__ . '/../conn.php';     // conn.php lives one level up, as a sibling of api/
+require __DIR__ . '/auth_check.php';  // auth_check.php lives alongside register_student.php in api/
 
-// If you already have api/helpers/response.php exporting respondOk()/respondError(),
-// `include` that instead of these two local functions — keeping every endpoint
-// on the exact same envelope shape matters more than where the functions live.
 function respondOk(array $data = [], int $status = 200): void {
     http_response_code($status);
     echo json_encode(array_merge(['ok' => true], $data));
@@ -45,19 +42,11 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
 }
 
 /* ---- Auth ---- */
-$authHeader = $_SERVER['HTTP_AUTHORIZATION'] ?? ($_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '');
-if (!preg_match('/Bearer\s+(\S+)/i', $authHeader, $m)) {
-    respondError('Missing bearer token', 401, 'no_token');
-}
-$token = $m[1];
-
-// TODO: replace with your real helper — this assumes a `tokens` table
-// (token, user_id, role, expires_at) shared with subjects.php / students.php.
-$user = verifyToken($conn, $token);
-if (!$user) {
-    respondError('Invalid or expired token', 401, 'invalid_token');
-}
-if (!in_array($user['role'], ['hoi', 'Dhoi', 'teacher'], true)) {
+// require_auth() (from auth_check.php) reads the Authorization header itself
+// via getallheaders() and exits with its own 401 JSON if the token is
+// missing/invalid — so no manual header parsing or verifyToken() call here.
+$session = require_auth();
+if (!in_array($session['role'], ['hoi', 'Dhoi', 'teacher'], true)) {
     respondError('Not authorized to register students', 403, 'forbidden');
 }
 

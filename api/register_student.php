@@ -88,6 +88,41 @@ if ($gradeRaw !== '') {
     $grade = (int)$gradeRaw;
 }
 
+/* ---- Duplicate check ----
+ * UPI and Assessment number are the two identifiers that are supposed to be
+ * unique per learner. Both fields are optional on this form, so this only
+ * runs — and only blocks registration — when at least one was actually
+ * provided; a firstName-only entry is never treated as a duplicate.
+ */
+if ($upi !== '' || $assessment !== '') {
+    $conditions = [];
+    if ($upi !== '') {
+        $upiSafe = mysqli_real_escape_string($conn, $upi);
+        $conditions[] = "UPI = '$upiSafe'";
+    }
+    if ($assessment !== '') {
+        $assessmentSafe = mysqli_real_escape_string($conn, $assessment);
+        $conditions[] = "Assesment = '$assessmentSafe'";
+    }
+    $whereClause = implode(' OR ', $conditions);
+
+    $dupRes = mysqli_query($conn, "SELECT id, firstName, surname FROM Student WHERE $whereClause LIMIT 1");
+    if ($dupRes === false) {
+        error_log('register_student.php duplicate check failed: ' . mysqli_error($conn));
+        respondError('Server error', 500, 'server_error');
+    }
+    if (mysqli_num_rows($dupRes) > 0) {
+        $existing = mysqli_fetch_assoc($dupRes);
+        $existingName = trim($existing['firstName'] . ' ' . $existing['surname']);
+        respondError(
+            'A learner with this UPI or Assessment number is already registered'
+                . ($existingName !== '' ? " ({$existingName})" : '') . '.',
+            409,
+            'duplicate_learner'
+        );
+    }
+}
+
 /* ---- Insert ----
  * Column order: UPI, Assesment, firstName, middleName, surname, DOB, Grade, birthNo
  * Type string:    s     s          s           s          s      s    i      s

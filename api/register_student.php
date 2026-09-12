@@ -14,7 +14,7 @@
 header('Content-Type: application/json');
 mysqli_report(MYSQLI_REPORT_OFF); // don't let a failed query throw; we handle errors ourselves
 
-include 'conn.php';
+include '../conn.php';
 include 'auth_check.php'; // <-- adjust to wherever your existing verifyToken()/Bearer-auth helper lives
 
 // If you already have api/helpers/response.php exporting respondOk()/respondError(),

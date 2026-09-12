@@ -1,4 +1,13 @@
 <?php
+
+header('Access-Control-Allow-Origin: *'); // or your specific origin(s)
+header('Access-Control-Allow-Methods: POST, OPTIONS');
+header('Access-Control-Allow-Headers: Content-Type, Authorization');
+
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    http_response_code(204);
+    exit;
+}
 /**
  * POST /api/register_student.php
  *

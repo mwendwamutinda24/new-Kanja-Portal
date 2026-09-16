@@ -14,8 +14,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit();
 }
 
-require_once __DIR__ . '/db_connect.php'; // adjust to your actual connection include
-require_once __DIR__ . '/auth_check.php'; // adjust to your actual token-auth include
+require_once __DIR__ . '/../conn.php';
+require_once __DIR__ . '/auth_check.php';
 
 // --- Auth: expect "Authorization: Bearer <token>" ---
 $headers = getallheaders();

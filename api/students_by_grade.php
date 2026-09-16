@@ -17,27 +17,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 require_once __DIR__ . '/../conn.php';
 require_once __DIR__ . '/auth_check.php';
 
-// --- Auth: expect "Authorization: Bearer <token>" ---
-$headers = getallheaders();
-$authHeader = $headers['Authorization'] ?? $headers['authorization'] ?? '';
-
-if (!preg_match('/Bearer\s+(.*)$/i', $authHeader, $matches)) {
-    http_response_code(401);
-    echo json_encode(['success' => false, 'message' => 'Missing or malformed Authorization header']);
-    exit();
-}
-
-$token = $matches[1];
-
-// Reuse whatever token-validation function the rest of the API already
-// uses (e.g. validateToken($token) -> user row or false). Adjust the
-// function name below to match your existing auth_check.php.
-$user = validateToken($token);
-if (!$user) {
-    http_response_code(401);
-    echo json_encode(['success' => false, 'message' => 'Invalid or expired token']);
-    exit();
-}
+// require_auth() already validates the Bearer token against api_sessions
+// and sends 401/exits on failure — no need to parse the header or call a
+// validateToken() function ourselves.
+$session = require_auth();
 
 // --- Validate grade param ---
 $grade = isset($_GET['grade']) ? trim($_GET['grade']) : '';
@@ -50,7 +33,6 @@ if ($grade === '' || !ctype_digit($grade) || (int)$grade < 1 || (int)$grade > 9)
 
 $gradeEscaped = mysqli_real_escape_string($conn, $grade);
 
-// Adjust table/column names below to match your actual students table schema.
 $sql = "SELECT
             assessment_no AS assessmentNo,
             upi,

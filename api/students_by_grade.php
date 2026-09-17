@@ -33,15 +33,17 @@ if ($grade === '' || !ctype_digit($grade) || (int)$grade < 1 || (int)$grade > 9)
 
 $gradeEscaped = mysqli_real_escape_string($conn, $grade);
 
+
+
 $sql = "SELECT
-            assessment_no AS assessmentNo,
-            upi,
-            full_name AS fullName,
-            dob,
-            birth_cert_no AS birthNo
-        FROM students
-        WHERE grade = '$gradeEscaped'
-        ORDER BY full_name ASC";
+            Assesment AS assessmentNo,
+            UPI AS upi,
+            CONCAT_WS(' ', firstName, middleName, surname) AS fullName,
+            DOB AS dob,
+            birthNo AS birthNo
+        FROM Student
+        WHERE Grade = '$gradeEscaped'
+        ORDER BY firstName ASC";
 
 $result = mysqli_query($conn, $sql);
 

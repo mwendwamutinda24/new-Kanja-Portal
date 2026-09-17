@@ -6,17 +6,13 @@
  * per-student list of averaged marks, optionally filtered by grade, term,
  * exam type, and subject.
  *
- * SCHEMA ASSUMPTIONS — please confirm against the real `exam2` table:
- *  1. `exam2` has columns `studentId`, `examTerm`, `examType`, `examYear`,
- *     matching the WHERE clause used in the roster-loading endpoint.
- *  2. Subject marks are stored as one column per subject code on the same
- *     row (e.g. `eng`, `math` — as seen in the roster endpoint), NOT as a
- *     separate `subject`/`score` pair. If that's wrong, the per-subject
- *     branch below (`$subjectCol`) needs to change to whatever the real
- *     shape is.
- *  3. "Passing" is defined here as an average across a student's subject
- *     marks for the matched exam combo being >= 50 — this wasn't specified
- *     anywhere, so confirm it matches how the web app defines pass/at-risk.
+ * Schema (confirmed against the real tables):
+ *  - `Student`: id, UPI, Assesment, firstName, middleName, surname,
+ *    parentName, parentPhone, birthNo, DOB, Grade, password, role
+ *  - `exam2`: id, student_id, Assesment, firstName, lastName, math, eng,
+ *    kisw, sst, scie, ca, agri, re, pretec, grade, term, exam_type, year
+ *    — subject marks are one column per subject code on the same row.
+ *  - "Passing" = average across a student's matched subject marks >= 50.
  */
 
 header('Access-Control-Allow-Origin: *');
@@ -85,21 +81,21 @@ if ($totalLearners > 0) {
         $idsInOrder
     ));
 
-    $conditions = ["studentId IN ($idsSafe)"];
+    $conditions = ["student_id IN ($idsSafe)"];
     if ($term !== '') {
-        $conditions[] = "examTerm = '" . mysqli_real_escape_string($conn, $term) . "'";
+        $conditions[] = "term = '" . mysqli_real_escape_string($conn, $term) . "'";
     }
     if ($examType !== '') {
-        $conditions[] = "examType = '" . mysqli_real_escape_string($conn, $examType) . "'";
+        $conditions[] = "exam_type = '" . mysqli_real_escape_string($conn, $examType) . "'";
     }
     $where = implode(' AND ', $conditions);
 
     if ($subject !== '') {
-        // Assumes `$subject` is passed as the exact subject column name
+        // $subject is expected to be the exact subject column name
         // (e.g. "math", "eng") — same convention as subjects_config.php's
         // subject codes.
         $subjectCol = mysqli_real_escape_string($conn, $subject);
-        $markRes = mysqli_query($conn, "SELECT studentId, examTerm, `$subjectCol` AS score FROM exam2 WHERE $where");
+        $markRes = mysqli_query($conn, "SELECT student_id, term, `$subjectCol` AS score FROM exam2 WHERE $where");
     } else {
         $markRes = mysqli_query($conn, "SELECT * FROM exam2 WHERE $where");
     }
@@ -108,10 +104,13 @@ if ($totalLearners > 0) {
         respond(['error' => 'Database error loading marks: ' . mysqli_error($conn)], 500);
     }
 
-    $reservedCols = ['id', 'studentId', 'examTerm', 'examType', 'examYear'];
+    // Non-subject columns on exam2 — must be excluded from the
+    // "average every remaining column" fallback below, or firstName/
+    // lastName/Assesment/grade get cast to floats and pollute the average.
+    $reservedCols = ['id', 'student_id', 'Assesment', 'firstName', 'lastName', 'grade', 'term', 'exam_type', 'year'];
 
     while ($mrow = mysqli_fetch_assoc($markRes)) {
-        $sid = $mrow['studentId'] ?? null;
+        $sid = $mrow['student_id'] ?? null;
         if ($sid === null || !isset($students[$sid])) continue;
 
         if (array_key_exists('score', $mrow)) {
@@ -141,7 +140,7 @@ if ($totalLearners > 0) {
             'learnerName' => trim($s['firstName'] . ' ' . $s['surname']),
             'initials'    => strtoupper(substr($s['firstName'], 0, 1) . substr($s['surname'], 0, 1)),
             'grade'       => $s['Grade'],
-            'term'        => $term !== '' ? $term : ($mrow['examTerm'] ?? ''),
+            'term'        => $term !== '' ? $term : ($mrow['term'] ?? ''),
             'average'     => round($avg, 1),
         ];
     }

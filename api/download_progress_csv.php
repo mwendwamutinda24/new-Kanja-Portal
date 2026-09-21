@@ -8,29 +8,55 @@
  *
  * AUTH NOTE: the mobile app's "Download CSV" button opens this URL via
  * Linking.openURL() (OS browser / share sheet) rather than fetch(), so
- * it cannot attach an Authorization header the way progress_records.php
- * is called. To keep require_auth() in auth_check.php working
- * unmodified, a `token` query param is accepted as a fallback and
- * folded into $_SERVER['HTTP_AUTHORIZATION'] before auth_check.php
- * runs, so require_auth() sees it exactly as if it arrived as a header.
+ * it cannot attach an Authorization header. auth_check.php's
+ * require_auth() reads the token via getallheaders(), which reflects
+ * the real incoming HTTP header table — writing to $_SERVER after the
+ * fact (an earlier version of this file did that) never reaches it, so
+ * require_auth() isn't used here. Instead this file replicates its
+ * exact session-lookup logic inline, checking the Authorization header
+ * first and falling back to a `?token=` query param.
  */
 
-if (!isset($_SERVER['HTTP_AUTHORIZATION']) && isset($_GET['token']) && trim((string) $_GET['token']) !== '') {
-    $_SERVER['HTTP_AUTHORIZATION'] = 'Bearer ' . trim((string) $_GET['token']);
+require __DIR__ . '/../conn.php';
+
+$token = '';
+$headers = function_exists('getallheaders') ? getallheaders() : [];
+$authHeader = $headers['Authorization'] ?? $headers['authorization'] ?? '';
+if (preg_match('/Bearer\s+(\S+)/', $authHeader, $m)) {
+    $token = $m[1];
+} elseif (isset($_GET['token']) && trim((string) $_GET['token']) !== '') {
+    $token = trim((string) $_GET['token']);
+}
+
+if ($token === '') {
+    http_response_code(401);
+    header('Content-Type: application/json');
+    echo json_encode(['success' => false, 'message' => 'Missing token']);
+    exit;
+}
+
+$stmt = $conn->prepare("SELECT * FROM api_sessions WHERE token=? AND expires_at > NOW()");
+$stmt->bind_param("s", $token);
+$stmt->execute();
+$result = $stmt->get_result();
+
+if ($result->num_rows === 0) {
+    http_response_code(401);
+    header('Content-Type: application/json');
+    echo json_encode(['success' => false, 'message' => 'Invalid or expired token']);
+    exit;
+}
+
+$session = $result->fetch_assoc();
+
+if (!in_array($session['role'], ['hoi', 'Dhoi', 'teacher'], true)) {
+    http_response_code(403);
+    header('Content-Type: application/json');
+    echo json_encode(['success' => false, 'message' => 'Not authorized for this resource']);
+    exit;
 }
 
 mysqli_report(MYSQLI_REPORT_OFF);
-
-require __DIR__ . '/../conn.php';
-require __DIR__ . '/auth_check.php';
-
-$session = require_auth();
-if (!in_array($session['role'], ['hoi', 'Dhoi', 'teacher'], true)) {
-    http_response_code(403);
-    header('Content-Type: text/plain; charset=UTF-8');
-    echo 'Not authorized.';
-    exit;
-}
 
 $grade    = trim((string) ($_GET['grade'] ?? ''));
 $term     = trim((string) ($_GET['term'] ?? ''));

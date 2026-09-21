@@ -1,27 +1,23 @@
 <?php
 // ============================================================
-// fetch_students.php
-// Load students for a given grade/term/year along with their
-// expected fee and amount already paid this term, so the front-end
-// can compute balances live as the teacher types.
-//
-// Called by:
-//   - Fee.php (web)          -> returns HTML <tr> rows
-//   - api/fee_students.php   -> passes ?format=json
+// api/fetch_students.php
+// Loads students for a given grade/term/year with their fee status.
+// Returns HTML <tr> rows for Fee.php, or JSON with ?format=json
+// for the mobile app.
 // ============================================================
 
 session_start();
-include 'conn.php';
+include __DIR__ . '/../conn.php';
 
 if (!$conn) {
     http_response_code(500);
     exit('DB connection failed');
 }
 
-$grade = isset($_GET['grade']) ? (int)$_GET['grade'] : 0;
-$termNum = isset($_GET['term']) ? preg_replace('/[^0-9]/', '', $_GET['term']) : '';
-$year  = isset($_GET['year'])  ? (int)$_GET['year'] : 0;
-$format = isset($_GET['format']) ? $_GET['format'] : 'html';
+$grade   = isset($_GET['grade']) ? (int)$_GET['grade'] : 0;
+$termNum = isset($_GET['term'])  ? preg_replace('/[^0-9]/', '', $_GET['term']) : '';
+$year    = isset($_GET['year'])  ? (int)$_GET['year'] : 0;
+$format  = isset($_GET['format']) ? $_GET['format'] : 'html';
 
 if (!$grade || $termNum === '' || !$year) {
     if ($format === 'json') {
@@ -35,11 +31,14 @@ if (!$grade || $termNum === '' || !$year) {
 
 $termLabel = "Term $termNum";
 
-// LEFT JOIN fee_records so students who have never been billed still show up
+// ── Grade is stored as an INT (6 in your table), so compare as int ──
+// ── Student primary name columns: firstName, middleName, surname    ──
+// ── UPI is the closest match to an "assessment number" — use it    ──
 $stmt = $conn->prepare("
     SELECT s.id,
-           s.assessmentNo,
+           s.UPI,
            s.firstName,
+           s.middleName,
            s.surname,
            COALESCE(f.expected_amount, 0) AS expected_amount,
            COALESCE(f.paid_amount,     0) AS paid_amount
@@ -48,9 +47,18 @@ $stmt = $conn->prepare("
            ON f.student_id = s.id
           AND f.term = ?
           AND f.year = ?
-    WHERE s.grade = ?
+    WHERE s.Grade = ?
     ORDER BY s.firstName, s.surname
 ");
+if (!$stmt) {
+    if ($format === 'json') {
+        header('Content-Type: application/json');
+        echo json_encode(['success' => false, 'error' => 'SQL error: ' . $conn->error]);
+    } else {
+        echo '<tr><td colspan="11"><p>SQL error: ' . htmlspecialchars($conn->error) . '</p></td></tr>';
+    }
+    exit;
+}
 $stmt->bind_param('sii', $termLabel, $year, $grade);
 $stmt->execute();
 $result = $stmt->get_result();
@@ -59,8 +67,9 @@ $students = [];
 while ($row = $result->fetch_assoc()) {
     $students[] = [
         'id'              => (int)$row['id'],
-        'assessmentNo'    => $row['assessmentNo'] ?: ('STU-' . str_pad($row['id'], 4, '0', STR_PAD_LEFT)),
+        'assessmentNo'    => $row['UPI'] ?: ('STU-' . str_pad($row['id'], 4, '0', STR_PAD_LEFT)),
         'firstName'       => $row['firstName'],
+        'middleName'      => $row['middleName'],
         'lastName'        => $row['surname'],
         'expected_amount' => (float)$row['expected_amount'],
         'paid_amount'     => (float)$row['paid_amount'],
@@ -68,14 +77,14 @@ while ($row = $result->fetch_assoc()) {
 }
 $stmt->close();
 
-// ─── JSON mode (mobile app) ─────────────────────────────────
+// ── JSON mode (mobile) ──────────────────────────────────────
 if ($format === 'json') {
     header('Content-Type: application/json');
-    echo json_encode(['success' => true, 'students' => $students]);
+    echo json_encode(['success' => true, 'count' => count($students), 'students' => $students]);
     exit;
 }
 
-// ─── HTML mode (web Fee.php) ────────────────────────────────
+// ── HTML mode (web Fee.php) ─────────────────────────────────
 if (empty($students)) {
     echo '<tr><td colspan="11">
         <div class="empty-state">
@@ -102,10 +111,8 @@ foreach ($students as $s) {
     echo '<td class="cell-expected">' . $expectedTxt . '</td>';
     echo '<td class="cell-paid">'     . $paidTxt     . '</td>';
 
-    // The four input cells the teacher fills in
     foreach (['school_fee', 'assessment_fee', 'activity_fee', 'other_fee'] as $field) {
         echo '<td><input type="number" step="0.01" min="0" name="' . $field . '[' . $s['id'] . ']" placeholder="0"></td>';
     }
-    // Row Total + Balance cells are appended by JS after insertion
     echo '</tr>';
 }

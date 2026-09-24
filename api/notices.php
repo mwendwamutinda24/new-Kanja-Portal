@@ -29,7 +29,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 mysqli_report(MYSQLI_REPORT_OFF);
 
 try {
-    include __DIR__ . '/conn.php';
+    include dirname(__DIR__) . '/conn.php';
 } catch (\Throwable $e) {
     http_response_code(500);
     echo json_encode(['success' => false, 'error' => 'Database connection failed.']);

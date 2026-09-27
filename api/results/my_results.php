@@ -63,6 +63,20 @@ function skp_simple_tier(float $score): array {
     return ['tier' => 'be', 'label' => 'Below Expectation'];
 }
 
+/* NEW — KNEC/JSS 8-point performance scale used by the Analysis PDF
+   (merit list "Total Pts"/"Avg Pts" and the distribution report's
+   "Avg Points"/"Prev Points"/"DEV" columns). Lower-grade 4-tier codes
+   are mapped onto the same 1–8 range so the same function works for
+   every grade. Verified against the sample merit list's totals. */
+function skp_band_points(string $code): int {
+    static $scale = [
+        'EE1' => 8, 'EE2' => 7, 'ME1' => 6, 'ME2' => 5,
+        'AE1' => 4, 'AE2' => 3, 'BE1' => 2, 'BE2' => 1,
+        'E.E' => 8, 'M.E' => 6, 'A.E' => 4, 'B.E' => 2,
+    ];
+    return $scale[$code] ?? 0;
+}
+
 if ($role === 'student') {
     // Students only ever see their own record.
     if (empty($session['user_id'])) {
@@ -162,9 +176,19 @@ $classBandsGraded   = [];
 $totalSum           = 0;
 $students           = [];
 
+// NEW — 8-tier per-subject tallies for the distribution report's
+// EE1/EE2/ME1/ME2/AE1/AE2/BE1/BE2 columns. Falls back gracefully to
+// 4-tier codes if this grade uses the lower-grade band system.
+$subjectSplitBands = array_fill_keys($subjectCodes, [
+    'EE1' => 0, 'EE2' => 0, 'ME1' => 0, 'ME2' => 0,
+    'AE1' => 0, 'AE2' => 0, 'BE1' => 0, 'BE2' => 0,
+]);
+
 foreach ($currentRows as $row) {
-    $subs = [];
-    $rowTotal = 0;
+    $subs          = [];
+    $subjBandCodes = []; // NEW — per-subject band code, reused for points + tallies
+    $rowTotal      = 0;
+
     foreach ($subjectCodes as $c) {
         $score = (int) ($row[$c] ?? 0);
         $subs[$c] = $score;
@@ -172,6 +196,12 @@ foreach ($currentRows as $row) {
         $subjectTotals[$c] += $score;
         $t = skp_simple_tier($score);
         $subjectBandsSimple[$c][$t['tier']]++;
+
+        $subjBand = skp_band_info_for_grade($score, $gradeInt)['code'];
+        $subjBandCodes[$c] = $subjBand;
+        if (isset($subjectSplitBands[$c][$subjBand])) {
+            $subjectSplitBands[$c][$subjBand]++;
+        }
     }
     $avgPerSubject = $subjectCount ? $rowTotal / $subjectCount : 0;
 
@@ -181,13 +211,22 @@ foreach ($currentRows as $row) {
     $graded = skp_band_info_for_grade((int) round($avgPerSubject), $gradeInt);
     $classBandsGraded[$graded['code']] = ($classBandsGraded[$graded['code']] ?? 0) + 1;
 
+    // NEW — total/average points for this student, from the subject band codes above.
+    $pointsSum = 0;
+    foreach ($subjBandCodes as $code) $pointsSum += skp_band_points($code);
+    $avgPoints = $subjectCount ? $pointsSum / $subjectCount : 0;
+
     $students[] = [
-        'assesment' => $row['Assesment'] ?? '',
-        'firstName' => $row['firstName'] ?? '',
-        'lastName'  => $row['lastName'] ?? '',
-        'subjects'  => $subs,
-        'total'     => $rowTotal,
-        'bandCode'  => $graded['code'],
+        'student_id'   => (string) ($row['student_id'] ?? ''), // NEW
+        'assesment'    => $row['Assesment'] ?? '',
+        'firstName'    => $row['firstName'] ?? '',
+        'lastName'     => $row['lastName'] ?? '',
+        'subjects'     => $subs,
+        'subjectBands' => $subjBandCodes, // NEW
+        'total'        => $rowTotal,
+        'bandCode'     => $graded['code'],
+        'totalPoints'  => $pointsSum,               // NEW
+        'avgPoints'    => round($avgPoints, 4),      // NEW
     ];
     $totalSum += $rowTotal;
 }
@@ -203,6 +242,48 @@ foreach ($students as $i => $s) {
         $students[$i]['rank'] = $rank;
         $prevTotal = $s['total'];
         $repeat = 1;
+    }
+}
+
+/* ════ NEW — Admission No. / Stream, joined from the Student table ════
+   `exam2` doesn't carry these, so this looks them up by student_id.
+   ADJUST `admissionNo` / `stream` below if your Student table uses
+   different column names. */
+$studentIds  = array_values(array_unique(array_filter(array_column($students, 'student_id'))));
+$studentMeta = []; // student_id => ['admNo' => ..., 'stream' => ...]
+if (count($studentIds) > 0) {
+    $idsSafe     = array_map(fn($id) => mysqli_real_escape_string($conn, $id), $studentIds);
+    $idsInClause = "'" . implode("','", $idsSafe) . "'";
+    $metaRes = mysqli_query($conn, "SELECT id, admissionNo, stream FROM Student WHERE id IN ($idsInClause)");
+    if ($metaRes !== false) {
+        while ($m = mysqli_fetch_assoc($metaRes)) {
+            $studentMeta[(string) $m['id']] = [
+                'admNo'  => $m['admissionNo'] ?? '',
+                'stream' => $m['stream'] ?? 'A',
+            ];
+        }
+    }
+}
+
+/* ════ NEW — Stream position: rank within each stream by total ════ */
+$byStream = [];
+foreach ($students as $i => $s) {
+    $stream = $studentMeta[$s['student_id']]['stream'] ?? 'A';
+    $byStream[$stream][] = $i;
+}
+foreach ($byStream as $stream => $indices) {
+    usort($indices, fn($a, $b) => $students[$b]['total'] <=> $students[$a]['total']);
+    $sRank = 1; $sPrevTotal = null; $sRepeat = 0;
+    foreach ($indices as $idx) {
+        if ($students[$idx]['total'] === $sPrevTotal) {
+            $students[$idx]['streamPos'] = $sRank;
+            $sRepeat++;
+        } else {
+            $sRank += $sRepeat;
+            $students[$idx]['streamPos'] = $sRank;
+            $sPrevTotal = $students[$idx]['total'];
+            $sRepeat = 1;
+        }
     }
 }
 
@@ -243,11 +324,12 @@ foreach ($breakdownCodes as $code) {
 }
 
 /* ════ PREVIOUS EXAM (for comparison) ════ */
-$hasPrev = false;
-$prevLabel = '';
-$prevMeans = [];
-$prevStudentCount = 0;
+$hasPrev            = false;
+$prevLabel          = '';
+$prevMeans          = [];
+$prevStudentCount   = 0;
 $prevClassMeanTotal = 0;
+$prevRows           = []; // NEW — raw previous rows, needed for per-student ranks/points below
 
 $prevExamMap  = ['opener' => null, 'midterm' => 'opener', 'endterm' => 'midterm'];
 $prevExamType = $prevExamMap[$examType] ?? null;
@@ -259,19 +341,21 @@ function skp_fetch_prev_stats($conn, string $gradeSafe, string $termInClause, st
           AND exam_type = '$examTypeSafe' AND year = '$yearSafe'");
     if ($res === false) return null;
     $totals = array_fill_keys($subjectCodes, 0);
-    $count = 0;
+    $count  = 0;
+    $rows   = []; // NEW
     while ($r = mysqli_fetch_assoc($res)) {
         foreach ($subjectCodes as $c) $totals[$c] += (int) ($r[$c] ?? 0);
         $count++;
+        $rows[] = $r; // NEW
     }
-    return $count > 0 ? [$totals, $count] : null;
+    return $count > 0 ? [$totals, $count, $rows] : null; // NEW — now returns rows too
 }
 
 if ($prevExamType) {
     $prevLabel = $examLabelMap[$prevExamType] ?? ucfirst($prevExamType);
     $stats = skp_fetch_prev_stats($conn, $gradeSafe, $termInClause, $prevExamType, $yearSafe, $subjectCodes);
     if ($stats !== null) {
-        [$prevTotals, $prevStudentCount] = $stats;
+        [$prevTotals, $prevStudentCount, $prevRows] = $stats;
         foreach ($subjectCodes as $c) $prevMeans[$c] = round($prevTotals[$c] / $prevStudentCount, 1);
         $prevClassMeanTotal = round(array_sum($prevTotals) / $prevStudentCount, 1);
         $hasPrev = true;
@@ -282,7 +366,7 @@ if (!$hasPrev && (int) $year > 2026) {
     $prevYearSafe = mysqli_real_escape_string($conn, $prevYear);
     $stats = skp_fetch_prev_stats($conn, $gradeSafe, $termInClause, $examType, $prevYearSafe, $subjectCodes);
     if ($stats !== null) {
-        [$prevTotals, $prevStudentCount] = $stats;
+        [$prevTotals, $prevStudentCount, $prevRows] = $stats;
         foreach ($subjectCodes as $c) $prevMeans[$c] = round($prevTotals[$c] / $prevStudentCount, 1);
         $prevClassMeanTotal = round(array_sum($prevTotals) / $prevStudentCount, 1);
         $prevLabel = "Year $prevYear ($examLabel)";
@@ -290,16 +374,83 @@ if (!$hasPrev && (int) $year > 2026) {
     }
 }
 
+/* ════ NEW — previous-term per-student rank/points (matched by student_id
+   for prevOverallPos/prevPoints) and per-subject average points (for the
+   distribution report's "Prev Points"/"DEV" columns). ════ */
+$prevStudentStats    = []; // student_id => ['rank' => ..., 'points' => ...]
+$prevSubjectAvgPoints = array_fill_keys($subjectCodes, null);
+
+if ($hasPrev && !empty($prevRows)) {
+    $prevList = [];
+    foreach ($prevRows as $r) {
+        $pTotal = 0; $pPointsSum = 0;
+        foreach ($subjectCodes as $c) {
+            $score = (int) ($r[$c] ?? 0);
+            $pTotal += $score;
+            $pPointsSum += skp_band_points(skp_band_info_for_grade($score, $gradeInt)['code']);
+        }
+        $prevList[] = [
+            'student_id' => (string) ($r['student_id'] ?? ''),
+            'total'      => $pTotal,
+            'points'     => $subjectCount ? round($pPointsSum / $subjectCount, 4) : 0,
+        ];
+    }
+    usort($prevList, fn($a, $b) => $b['total'] <=> $a['total']);
+    $pr = 1; $pPrevTotal = null; $pRepeat = 0;
+    foreach ($prevList as $i => $p) {
+        if ($p['total'] === $pPrevTotal) {
+            $prevList[$i]['rank'] = $pr;
+            $pRepeat++;
+        } else {
+            $pr += $pRepeat;
+            $prevList[$i]['rank'] = $pr;
+            $pPrevTotal = $p['total'];
+            $pRepeat = 1;
+        }
+        if ($prevList[$i]['student_id'] !== '') {
+            $prevStudentStats[$prevList[$i]['student_id']] = [
+                'rank'   => $prevList[$i]['rank'],
+                'points' => $prevList[$i]['points'],
+            ];
+        }
+    }
+
+    foreach ($subjectCodes as $c) {
+        $sum = 0;
+        foreach ($prevRows as $r) {
+            $score = (int) ($r[$c] ?? 0);
+            $sum += skp_band_points(skp_band_info_for_grade($score, $gradeInt)['code']);
+        }
+        $prevSubjectAvgPoints[$c] = count($prevRows) ? round($sum / count($prevRows), 4) : null;
+    }
+}
+
 /* ════ ASSEMBLE OUTPUT ════ */
 $subjectsOut = [];
 foreach ($subjectCodes as $i => $c) {
     $mean = $subjectMeans[$c];
+
+    // NEW — this subject's average points this term (mean of every
+    // student's band-points for this subject).
+    $subjPointsSum = 0;
+    foreach ($students as $s) $subjPointsSum += skp_band_points($s['subjectBands'][$c] ?? '');
+    $subjAvgPoints = $studentCount ? round($subjPointsSum / $studentCount, 4) : 0;
+
     $subjectsOut[] = [
         'code'  => $c,
         'label' => $subjectLabels[$i],
         'mean'  => $mean,
         'tier'  => skp_simple_tier($mean)['tier'],
         'bands' => $subjectBandsSimple[$c],
+        // NEW — feed the Analysis PDF's distribution report:
+        'splitBands' => $subjectSplitBands[$c],
+        'entry'      => $studentCount,
+        'avgPoints'  => $subjAvgPoints,
+        'prevPoints' => $prevSubjectAvgPoints[$c] ?? null,
+        // Teacher name: add a 'teacher' key per subject in
+        // skp_subjects_for_grade()/_config.php to populate this —
+        // defaults to '' until that exists.
+        'teacher'    => $subjectMap[$i]['teacher'] ?? '',
     ];
 }
 
@@ -326,6 +477,10 @@ foreach ($students as $s) {
         $band  = skp_band_info_for_grade($score, $gradeInt);
         $subjOut[] = ['code' => $c, 'label' => $subjectLabels[$i], 'score' => $score, 'bandCode' => $band['code']];
     }
+
+    $meta      = $studentMeta[$s['student_id']] ?? ['admNo' => '', 'stream' => 'A'];
+    $prevStats = $prevStudentStats[$s['student_id']] ?? null;
+
     $studentsOut[] = [
         'rank'      => $s['rank'],
         'assesment' => $s['assesment'],
@@ -334,6 +489,18 @@ foreach ($students as $s) {
         'subjects'  => $subjOut,
         'total'     => $s['total'],
         'bandCode'  => $s['bandCode'],
+        // NEW — feed the Analysis PDF's merit list:
+        'admNo'          => $meta['admNo'],
+        'stream'         => $meta['stream'],
+        'streamPos'      => $s['streamPos'] ?? $s['rank'],
+        'totalPoints'    => $s['totalPoints'],
+        'avgPoints'      => $s['avgPoints'],
+        // NOTE: prevStreamPos reuses last term's overall rank (re-deriving
+        // last term's stream membership would need another Student join
+        // scoped to that term) — swap in a real value if you need it exact.
+        'prevOverallPos' => $prevStats['rank'] ?? null,
+        'prevStreamPos'  => $prevStats['rank'] ?? null,
+        'prevPoints'     => $prevStats['points'] ?? null,
     ];
 }
 

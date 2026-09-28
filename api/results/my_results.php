@@ -67,11 +67,12 @@ function skp_simple_tier(float $score): array {
    (merit list "Total Pts"/"Avg Pts" and the distribution report's
    "Avg Points"/"Prev Points"/"DEV" columns). Lower-grade 4-tier codes
    are mapped onto the same 1–8 range so the same function works for
-   every grade. Verified against the sample merit list's totals. */
+   every grade. */
 function skp_band_points(string $code): int {
     static $scale = [
-        'EE1' => 8, 'EE2' => 7, 'ME1' => 6, 'ME2' => 5,
-        'AE1' => 4, 'AE2' => 3, 'BE1' => 2, 'BE2' => 1,
+        // App convention: "2" is the HIGHER sub-band (EE2 = 90+), same as bandFor8().
+        'EE2' => 8, 'EE1' => 7, 'ME2' => 6, 'ME1' => 5,
+        'AE2' => 4, 'AE1' => 3, 'BE2' => 2, 'BE1' => 1,
         'E.E' => 8, 'M.E' => 6, 'A.E' => 4, 'B.E' => 2,
     ];
     return $scale[$code] ?? 0;

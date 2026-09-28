@@ -2,9 +2,16 @@
 /**
  * GET /api/progress_records.php
  *
- * Backs the Progress Records screen: returns summary stats plus a
- * per-student list of averaged marks, optionally filtered by grade, term,
- * exam type, and subject.
+ * Backs the Progress Records screen. Returns:
+ *   - records:  one row per learner / exam / subject mark
+ *   - learners: every learner, for the Learner dropdown
+ *   - years:    every distinct exam year, for the Year dropdown
+ *
+ * Query params (all optional): grade, term, exam_type, year, subject, student_id
+ *   grade      e.g. "6"            (also matches "Grade 6" if that's what's stored)
+ *   term       e.g. "2"            (also matches "Term 2")
+ *   exam_type  opener | midterm | endterm  (matches "Mid-Term", "End Term", etc.)
+ *   subject    math | eng | kisw | sst | scie | ca | agri | re | pretec
  *
  * Schema (confirmed against the real tables):
  *  - `Student`: id, UPI, Assesment, firstName, middleName, surname,
@@ -12,7 +19,9 @@
  *  - `exam2`: id, student_id, Assesment, firstName, lastName, math, eng,
  *    kisw, sst, scie, ca, agri, re, pretec, grade, term, exam_type, year
  *    — subject marks are one column per subject code on the same row.
- *  - "Passing" = average across a student's matched subject marks >= 50.
+ *
+ * Stats (learners, mean, passing, at risk) are calculated in the app from
+ * the returned records, so they always match the rows on screen.
  */
 
 header('Access-Control-Allow-Origin: *');
@@ -45,113 +54,114 @@ if (!in_array($session['role'], ['hoi', 'Dhoi', 'teacher'], true)) {
     respond(['error' => 'Not authorized.'], 403);
 }
 
-$grade    = trim((string) ($_GET['grade'] ?? ''));
-$term     = trim((string) ($_GET['term'] ?? ''));
-$examType = trim((string) ($_GET['examType'] ?? ''));
-$subject  = trim((string) ($_GET['subject'] ?? ''));
+/* Subject columns on exam2, in display order */
+$subjectCodes = ['math', 'eng', 'kisw', 'sst', 'scie', 'ca', 'agri', 're', 'pretec'];
+$examCodes    = ['opener', 'midterm', 'endterm'];
 
-/* ---- Students (optionally filtered by grade) ---- */
-$studentWhere = '1=1';
-if ($grade !== '') {
-    $gradeSafe = mysqli_real_escape_string($conn, $grade);
-    $studentWhere = "Grade = '$gradeSafe'";
+/* ---- Filters ---- */
+$gradeIn   = preg_replace('/\D/', '', (string) ($_GET['grade'] ?? ''));
+$termIn    = preg_replace('/\D/', '', (string) ($_GET['term'] ?? ''));
+$yearIn    = (int) ($_GET['year'] ?? 0);
+$studentIn = (int) ($_GET['student_id'] ?? 0);
+
+$examIn = strtolower(trim((string) ($_GET['exam_type'] ?? '')));
+if (!in_array($examIn, $examCodes, true)) $examIn = '';
+
+$subjectIn = trim((string) ($_GET['subject'] ?? ''));
+if (!in_array($subjectIn, $subjectCodes, true)) $subjectIn = '';
+
+$conditions = ['1=1'];
+
+if ($gradeIn !== '') {
+    $g = (int) $gradeIn;
+    $conditions[] = "(e.grade = '$g' OR e.grade = 'Grade $g')";
+}
+if ($termIn !== '') {
+    $t = (int) $termIn;
+    $conditions[] = "(e.term = '$t' OR e.term = 'Term $t')";
+}
+if ($examIn !== '') {
+    // Normalise "Mid-Term" / "End Term" / "endterm" etc. before comparing
+    $conditions[] = "LOWER(REPLACE(REPLACE(e.exam_type, '-', ''), ' ', '')) = '"
+                  . mysqli_real_escape_string($conn, $examIn) . "'";
+}
+if ($yearIn > 0) {
+    $conditions[] = "e.year = $yearIn";
+}
+if ($studentIn > 0) {
+    $conditions[] = "s.id = $studentIn";
 }
 
-$studRes = mysqli_query($conn, "SELECT id, Assesment, firstName, surname, Grade FROM Student WHERE $studentWhere");
-if ($studRes === false) {
-    respond(['error' => 'Database error loading students: ' . mysqli_error($conn)], 500);
+/* Only pull the subject column(s) we need */
+$subjectsToUse = $subjectIn !== '' ? [$subjectIn] : $subjectCodes;
+$subjectSelect = implode(', ', array_map(fn($c) => "e.`$c`", $subjectsToUse));
+
+$sql = "SELECT s.id AS student_id, s.Assesment, s.firstName, s.surname,
+               e.id AS exam_id, e.grade, e.term, e.exam_type, e.year,
+               $subjectSelect
+        FROM exam2 e
+        JOIN Student s ON s.id = e.student_id
+        WHERE " . implode(' AND ', $conditions) . "
+        ORDER BY s.firstName, s.surname, e.year DESC, e.term DESC, e.id";
+
+$res = mysqli_query($conn, $sql);
+if ($res === false) {
+    respond(['error' => 'Database error loading marks: ' . mysqli_error($conn)], 500);
 }
 
-$students = [];
-$idsInOrder = [];
-while ($row = mysqli_fetch_assoc($studRes)) {
-    $students[$row['id']] = $row;
-    $idsInOrder[] = $row['id'];
-}
-
-$totalLearners = count($idsInOrder);
-$recordsLogged = 0;
-$passing = 0;
-$atRisk = 0;
+/* ---- Unpivot: one record per subject mark ---- */
 $records = [];
+while ($row = mysqli_fetch_assoc($res)) {
+    // Store "Grade 6" / "Term 2" as plain numbers; the app adds the words.
+    $gradeOut = preg_replace('/\D/', '', (string) $row['grade']);
+    $termOut  = preg_replace('/\D/', '', (string) $row['term']);
+    // Normalise exam type to opener | midterm | endterm when it matches
+    $examNorm = strtolower(str_replace(['-', ' '], '', (string) $row['exam_type']));
+    $examOut  = in_array($examNorm, $examCodes, true) ? $examNorm : (string) $row['exam_type'];
 
-if ($totalLearners > 0) {
-    $idsSafe = implode(',', array_map(
-        fn($id) => "'" . mysqli_real_escape_string($conn, $id) . "'",
-        $idsInOrder
-    ));
+    foreach ($subjectsToUse as $code) {
+        $val = $row[$code] ?? null;
+        if ($val === null || $val === '') continue; // no mark entered
 
-    $conditions = ["student_id IN ($idsSafe)"];
-    if ($term !== '') {
-        $conditions[] = "term = '" . mysqli_real_escape_string($conn, $term) . "'";
-    }
-    if ($examType !== '') {
-        $conditions[] = "exam_type = '" . mysqli_real_escape_string($conn, $examType) . "'";
-    }
-    $where = implode(' AND ', $conditions);
-
-    if ($subject !== '') {
-        // $subject is expected to be the exact subject column name
-        // (e.g. "math", "eng") — same convention as subjects_config.php's
-        // subject codes.
-        $subjectCol = mysqli_real_escape_string($conn, $subject);
-        $markRes = mysqli_query($conn, "SELECT student_id, term, `$subjectCol` AS score FROM exam2 WHERE $where");
-    } else {
-        $markRes = mysqli_query($conn, "SELECT * FROM exam2 WHERE $where");
-    }
-
-    if ($markRes === false) {
-        respond(['error' => 'Database error loading marks: ' . mysqli_error($conn)], 500);
-    }
-
-    // Non-subject columns on exam2 — must be excluded from the
-    // "average every remaining column" fallback below, or firstName/
-    // lastName/Assesment/grade get cast to floats and pollute the average.
-    $reservedCols = ['id', 'student_id', 'Assesment', 'firstName', 'lastName', 'grade', 'term', 'exam_type', 'year'];
-
-    while ($mrow = mysqli_fetch_assoc($markRes)) {
-        $sid = $mrow['student_id'] ?? null;
-        if ($sid === null || !isset($students[$sid])) continue;
-
-        if (array_key_exists('score', $mrow)) {
-            $scores = ($mrow['score'] === null || $mrow['score'] === '') ? [] : [(float) $mrow['score']];
-        } else {
-            $scores = [];
-            foreach ($mrow as $col => $val) {
-                if (in_array($col, $reservedCols, true)) continue;
-                if ($val === null || $val === '') continue;
-                $scores[] = (float) $val;
-            }
-        }
-
-        if (empty($scores)) continue;
-
-        $avg = array_sum($scores) / count($scores);
-        $recordsLogged++;
-        if ($avg >= 50) {
-            $passing++;
-        } else {
-            $atRisk++;
-        }
-
-        $s = $students[$sid];
         $records[] = [
-            'id'          => $sid,
-            'learnerName' => trim($s['firstName'] . ' ' . $s['surname']),
-            'initials'    => strtoupper(substr($s['firstName'], 0, 1) . substr($s['surname'], 0, 1)),
-            'grade'       => $s['Grade'],
-            'term'        => $term !== '' ? $term : ($mrow['term'] ?? ''),
-            'average'     => round($avg, 1),
+            'studentId' => (int) $row['student_id'],
+            'admNo'     => $row['Assesment'],
+            'firstName' => $row['firstName'],
+            'surname'   => $row['surname'],
+            'grade'     => $gradeOut !== '' ? $gradeOut : $row['grade'],
+            'term'      => $termOut !== '' ? $termOut : $row['term'],
+            'examType'  => $examOut,
+            'year'      => $row['year'],
+            'subject'   => $code,
+            'score'     => (float) $val,
         ];
     }
 }
 
+/* ---- Learner list for the Learner dropdown ---- */
+$learners = [];
+$lr = mysqli_query($conn, "SELECT id, firstName, surname, Grade FROM Student ORDER BY firstName, surname");
+if ($lr) {
+    while ($r = mysqli_fetch_assoc($lr)) {
+        $learners[] = [
+            'id'    => (int) $r['id'],
+            'name'  => trim($r['firstName'] . ' ' . $r['surname']),
+            'grade' => $r['Grade'],
+        ];
+    }
+}
+
+/* ---- Distinct exam years for the Year dropdown ---- */
+$years = [];
+$yr = mysqli_query($conn, "SELECT DISTINCT year FROM exam2 WHERE year IS NOT NULL AND year <> '' ORDER BY year DESC");
+if ($yr) {
+    while ($r = mysqli_fetch_assoc($yr)) {
+        $years[] = (int) $r['year'];
+    }
+}
+
 respond([
-    'stats' => [
-        'totalLearners' => $totalLearners,
-        'recordsLogged' => $recordsLogged,
-        'passing'       => $passing,
-        'atRisk'        => $atRisk,
-    ],
-    'records' => $records,
+    'records'  => $records,
+    'learners' => $learners,
+    'years'    => $years,
 ]);

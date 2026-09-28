@@ -2,26 +2,23 @@
 /**
  * GET /api/progress_records.php
  *
- * Backs the Progress Records screen. Returns:
- *   - records:  one row per learner / exam / subject mark
- *   - learners: every learner, for the Learner dropdown
- *   - years:    every distinct exam year, for the Year dropdown
+ * Returns:
+ *   - records:   one row per learner / exam / subject mark
+ *   - learners:  every learner, for the Learner dropdown
+ *   - years:     every distinct exam year, for the Year dropdown
+ *   - examTypes: every distinct exam type found in exam2 (opener, midterm,
+ *                endterm AND any others that have been added), as
+ *                [{ value, label }], for the Exam dropdown
  *
  * Query params (all optional): grade, term, exam_type, year, subject, student_id
- *   grade      e.g. "6"            (also matches "Grade 6" if that's what's stored)
- *   term       e.g. "2"            (also matches "Term 2")
- *   exam_type  opener | midterm | endterm  (matches "Mid-Term", "End Term", etc.)
- *   subject    math | eng | kisw | sst | scie | ca | agri | re | pretec
+ *   exam_type is the `value` from examTypes (lowercase, no spaces/hyphens),
+ *   e.g. opener | midterm | endterm | <any other added exam>
  *
- * Schema (confirmed against the real tables):
+ * Schema:
  *  - `Student`: id, UPI, Assesment, firstName, middleName, surname,
  *    parentName, parentPhone, birthNo, DOB, Grade, password, role
  *  - `exam2`: id, student_id, Assesment, firstName, lastName, math, eng,
  *    kisw, sst, scie, ca, agri, re, pretec, grade, term, exam_type, year
- *    — subject marks are one column per subject code on the same row.
- *
- * Stats (learners, mean, passing, at risk) are calculated in the app from
- * the returned records, so they always match the rows on screen.
  */
 
 header('Access-Control-Allow-Origin: *');
@@ -54,18 +51,26 @@ if (!in_array($session['role'], ['hoi', 'Dhoi', 'teacher'], true)) {
     respond(['error' => 'Not authorized.'], 403);
 }
 
-/* Subject columns on exam2, in display order */
 $subjectCodes = ['math', 'eng', 'kisw', 'sst', 'scie', 'ca', 'agri', 're', 'pretec'];
-$examCodes    = ['opener', 'midterm', 'endterm'];
+
+/* Exam type helpers: "Mid-Term", "midterm", "Mid Term" all become "midterm" */
+$knownExamLabels = ['opener' => 'Opener', 'midterm' => 'Mid-Term', 'endterm' => 'End Term'];
+
+function exam_key($s) {
+    return strtolower(str_replace(['-', ' '], '', trim((string) $s)));
+}
+function exam_label($raw) {
+    global $knownExamLabels;
+    $k = exam_key($raw);
+    return $knownExamLabels[$k] ?? trim((string) $raw);
+}
 
 /* ---- Filters ---- */
 $gradeIn   = preg_replace('/\D/', '', (string) ($_GET['grade'] ?? ''));
 $termIn    = preg_replace('/\D/', '', (string) ($_GET['term'] ?? ''));
 $yearIn    = (int) ($_GET['year'] ?? 0);
 $studentIn = (int) ($_GET['student_id'] ?? 0);
-
-$examIn = strtolower(trim((string) ($_GET['exam_type'] ?? '')));
-if (!in_array($examIn, $examCodes, true)) $examIn = '';
+$examIn    = exam_key($_GET['exam_type'] ?? '');
 
 $subjectIn = trim((string) ($_GET['subject'] ?? ''));
 if (!in_array($subjectIn, $subjectCodes, true)) $subjectIn = '';
@@ -81,18 +86,12 @@ if ($termIn !== '') {
     $conditions[] = "(e.term = '$t' OR e.term = 'Term $t')";
 }
 if ($examIn !== '') {
-    // Normalise "Mid-Term" / "End Term" / "endterm" etc. before comparing
     $conditions[] = "LOWER(REPLACE(REPLACE(e.exam_type, '-', ''), ' ', '')) = '"
                   . mysqli_real_escape_string($conn, $examIn) . "'";
 }
-if ($yearIn > 0) {
-    $conditions[] = "e.year = $yearIn";
-}
-if ($studentIn > 0) {
-    $conditions[] = "s.id = $studentIn";
-}
+if ($yearIn > 0)    $conditions[] = "e.year = $yearIn";
+if ($studentIn > 0) $conditions[] = "s.id = $studentIn";
 
-/* Only pull the subject column(s) we need */
 $subjectsToUse = $subjectIn !== '' ? [$subjectIn] : $subjectCodes;
 $subjectSelect = implode(', ', array_map(fn($c) => "e.`$c`", $subjectsToUse));
 
@@ -112,16 +111,12 @@ if ($res === false) {
 /* ---- Unpivot: one record per subject mark ---- */
 $records = [];
 while ($row = mysqli_fetch_assoc($res)) {
-    // Store "Grade 6" / "Term 2" as plain numbers; the app adds the words.
     $gradeOut = preg_replace('/\D/', '', (string) $row['grade']);
     $termOut  = preg_replace('/\D/', '', (string) $row['term']);
-    // Normalise exam type to opener | midterm | endterm when it matches
-    $examNorm = strtolower(str_replace(['-', ' '], '', (string) $row['exam_type']));
-    $examOut  = in_array($examNorm, $examCodes, true) ? $examNorm : (string) $row['exam_type'];
 
     foreach ($subjectsToUse as $code) {
         $val = $row[$code] ?? null;
-        if ($val === null || $val === '') continue; // no mark entered
+        if ($val === null || $val === '') continue;
 
         $records[] = [
             'studentId' => (int) $row['student_id'],
@@ -130,7 +125,8 @@ while ($row = mysqli_fetch_assoc($res)) {
             'surname'   => $row['surname'],
             'grade'     => $gradeOut !== '' ? $gradeOut : $row['grade'],
             'term'      => $termOut !== '' ? $termOut : $row['term'],
-            'examType'  => $examOut,
+            'examType'  => exam_key($row['exam_type']),
+            'examLabel' => exam_label($row['exam_type']),
             'year'      => $row['year'],
             'subject'   => $code,
             'score'     => (float) $val,
@@ -138,7 +134,7 @@ while ($row = mysqli_fetch_assoc($res)) {
     }
 }
 
-/* ---- Learner list for the Learner dropdown ---- */
+/* ---- Learner list ---- */
 $learners = [];
 $lr = mysqli_query($conn, "SELECT id, firstName, surname, Grade FROM Student ORDER BY firstName, surname");
 if ($lr) {
@@ -151,7 +147,7 @@ if ($lr) {
     }
 }
 
-/* ---- Distinct exam years for the Year dropdown ---- */
+/* ---- Distinct years ---- */
 $years = [];
 $yr = mysqli_query($conn, "SELECT DISTINCT year FROM exam2 WHERE year IS NOT NULL AND year <> '' ORDER BY year DESC");
 if ($yr) {
@@ -160,8 +156,30 @@ if ($yr) {
     }
 }
 
+/* ---- Distinct exam types (all of them, including any added later) ---- */
+$examMap = [];
+$er = mysqli_query($conn, "SELECT DISTINCT exam_type FROM exam2 WHERE exam_type IS NOT NULL AND exam_type <> ''");
+if ($er) {
+    while ($r = mysqli_fetch_assoc($er)) {
+        $k = exam_key($r['exam_type']);
+        if ($k === '' || isset($examMap[$k])) continue;
+        $examMap[$k] = ['value' => $k, 'label' => exam_label($r['exam_type'])];
+    }
+}
+// Opener, Mid-Term, End Term first, then any others alphabetically
+$order = array_keys($knownExamLabels);
+uasort($examMap, function ($a, $b) use ($order) {
+    $ia = array_search($a['value'], $order, true);
+    $ib = array_search($b['value'], $order, true);
+    $ia = $ia === false ? 99 : $ia;
+    $ib = $ib === false ? 99 : $ib;
+    return $ia === $ib ? strcasecmp($a['label'], $b['label']) : $ia <=> $ib;
+});
+$examTypes = array_values($examMap);
+
 respond([
-    'records'  => $records,
-    'learners' => $learners,
-    'years'    => $years,
+    'records'   => $records,
+    'learners'  => $learners,
+    'years'     => $years,
+    'examTypes' => $examTypes,
 ]);

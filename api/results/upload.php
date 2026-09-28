@@ -10,6 +10,8 @@ require __DIR__ . '/../auth_check.php';
 require __DIR__ . '/_config.php';
 require __DIR__ . '/_input.php';
 
+mysqli_report(MYSQLI_REPORT_OFF);
+
 function respond($data, $code = 200) {
     http_response_code($code);
     echo json_encode($data);
@@ -41,13 +43,34 @@ if (!is_array($students) || count($students) === 0) {
     respond(['success' => false, 'message' => 'No students provided'], 422);
 }
 
-$subjects = skp_subjects_for_grade($grade);
+$subjects   = skp_subjects_for_grade($grade);
 $validCodes = array_column($subjects, 'code');
 
-$gradeSafe    = mysqli_real_escape_string($conn, $grade);
-$termSafe     = mysqli_real_escape_string($conn, $term);
-$examTypeSafe = mysqli_real_escape_string($conn, $examType);
-$yearSafe     = mysqli_real_escape_string($conn, $year);
+/*
+ * exam2 schema (confirmed via phpMyAdmin):
+ *   id, student_id, Assesment, firstName, lastName,
+ *   math, eng, kisw, sst, scie, ca, agri, re, pretec,
+ *   grade, term, exam_type, year
+ *
+ * exam2.term is stored as "Term 1" / "Term 2" / "Term 3" (same as the web
+ * upload flow and ViewResults.php). The app sends a bare digit, so we
+ * normalise to "Term N" for writes, and match BOTH formats when looking
+ * for an existing row, so older rows saved either way are still found
+ * and updated instead of duplicated.
+ */
+$termDigits = preg_replace('/[^0-9]/', '', $term);
+$termLabel  = $termDigits !== '' ? "Term $termDigits" : $term;
+
+$gradeSafe     = mysqli_real_escape_string($conn, $grade);
+$termLabelSafe = mysqli_real_escape_string($conn, $termLabel);
+$examTypeSafe  = mysqli_real_escape_string($conn, $examType);
+$yearSafe      = mysqli_real_escape_string($conn, $year);
+
+$termCandidates = ["'$termLabelSafe'"];
+if ($termDigits !== '') {
+    $termCandidates[] = "'" . mysqli_real_escape_string($conn, $termDigits) . "'";
+}
+$termInClause = implode(',', array_unique($termCandidates));
 
 $saved = 0;
 $skipped = 0;
@@ -57,15 +80,16 @@ foreach ($students as $entry) {
     $studentId = isset($entry['id']) ? (string) $entry['id'] : '';
     $marksIn   = is_array($entry['marks'] ?? null) ? $entry['marks'] : [];
 
-    if ($studentId === '') {
-        $errors[] = 'Skipped a row with no student id';
+    if ($studentId === '' || !ctype_digit($studentId)) {
+        $errors[] = 'Skipped a row with no valid student id';
         $skipped++;
         continue;
     }
+    $studentIdInt = (int) $studentId;
 
-    // Only keep known subject codes with a genuinely non-blank value — a
+    // Only keep known subject codes with a genuinely non-blank value. A
     // student with all-blank marks is skipped entirely, not saved as a
-    // zeroed-out row, same as the web app's manual-entry behaviour.
+    // zeroed-out row.
     $marks = [];
     foreach ($marksIn as $code => $val) {
         if (!in_array($code, $validCodes, true)) continue;
@@ -82,25 +106,27 @@ foreach ($students as $entry) {
         continue;
     }
 
-    $studentIdSafe = mysqli_real_escape_string($conn, $studentId);
-
-    // Confirm the student actually exists (and belongs to this grade)
-    // before writing anything.
-    $chk = mysqli_query($conn, "SELECT id FROM Student WHERE id = '$studentIdSafe' AND Grade = '$gradeSafe' LIMIT 1");
+    // Confirm the student exists in this grade, and grab the identity
+    // fields exam2 also stores (Assesment, firstName, lastName).
+    $chk = mysqli_query(
+        $conn,
+        "SELECT id, Assesment, firstName, surname FROM Student
+         WHERE id = $studentIdInt AND Grade = '$gradeSafe' LIMIT 1"
+    );
     if (!$chk || mysqli_num_rows($chk) === 0) {
         $errors[] = "Student $studentId not found in Grade $grade";
         $skipped++;
         continue;
     }
+    $stu = mysqli_fetch_assoc($chk);
 
-    // CONFIRM: column names (studentId, examTerm, examType, examYear) —
-    // adjust to match the real exam2 schema once shared.
     $existing = mysqli_query($conn, "
         SELECT id FROM exam2
-        WHERE studentId = '$studentIdSafe'
-          AND examTerm = '$termSafe'
-          AND examType = '$examTypeSafe'
-          AND examYear = '$yearSafe'
+        WHERE student_id = $studentIdInt
+          AND grade = '$gradeSafe'
+          AND term IN ($termInClause)
+          AND exam_type = '$examTypeSafe'
+          AND year = '$yearSafe'
         LIMIT 1
     ");
 
@@ -112,20 +138,37 @@ foreach ($students as $entry) {
 
     if (mysqli_num_rows($existing) > 0) {
         // UPDATE only the subject columns actually submitted, so subjects
-        // not in this payload keep whatever was there before.
-        $setParts = [];
+        // not in this payload keep whatever was there before. Term is also
+        // normalised to "Term N" in case the old row used the bare digit.
+        $setParts = ["term = '$termLabelSafe'"];
         foreach ($marks as $code => $val) {
             $setParts[] = "`$code` = $val";
         }
         $setSql = implode(', ', $setParts);
-        $row = mysqli_fetch_assoc($existing);
+        $row    = mysqli_fetch_assoc($existing);
         $examId = (int) $row['id'];
 
         $ok = mysqli_query($conn, "UPDATE exam2 SET $setSql WHERE id = $examId");
     } else {
-        $cols = array_merge(['studentId', 'examTerm', 'examType', 'examYear'], array_keys($marks));
+        $assesSafe = mysqli_real_escape_string($conn, (string) ($stu['Assesment'] ?? ''));
+        $firstSafe = mysqli_real_escape_string($conn, (string) ($stu['firstName'] ?? ''));
+        $lastSafe  = mysqli_real_escape_string($conn, (string) ($stu['surname'] ?? ''));
+
+        $cols = array_merge(
+            ['student_id', 'Assesment', 'firstName', 'lastName', 'grade', 'term', 'exam_type', 'year'],
+            array_keys($marks)
+        );
         $vals = array_merge(
-            ["'$studentIdSafe'", "'$termSafe'", "'$examTypeSafe'", "'$yearSafe'"],
+            [
+                $studentIdInt,
+                "'$assesSafe'",
+                "'$firstSafe'",
+                "'$lastSafe'",
+                "'$gradeSafe'",
+                "'$termLabelSafe'",
+                "'$examTypeSafe'",
+                "'$yearSafe'",
+            ],
             array_values($marks)
         );
         $colsSql = implode(', ', array_map(fn($c) => "`$c`", $cols));

@@ -4,14 +4,11 @@
 //
 // Fee tracking summary for the Track Fees screen.
 //   GET ?grade=6&term=3&year=2026&search=amina
-//   (grade / term omitted or non-numeric = all)
+//   (grade / term omitted = all)
 //
 // Returns:
 //   { success, stats:{totalCollected,totalOutstanding,learnersWithBalance},
 //     learners:[{id,initials,name,grade,schoolFee,paid,balance,status}] }
-//
-// schoolFee = expected total from FeeStructure (summed over the
-// selected terms), paid = SUM of Fees rows for the same filter.
 // ============================================================
 
 session_start();
@@ -51,8 +48,8 @@ $sql    = "SELECT Grade, Term, ExpectedFee, ExpectedAssesmentFee, ExpectedActivi
 $types  = 'i';
 $params = [$year];
 if ($term > 0) {
-    $sql    .= " AND Term = ?";
-    $types  .= 'i';
+    $sql     .= " AND Term = ?";
+    $types   .= 'i';
     $params[] = $term;
 }
 $stmt = $conn->prepare($sql);
@@ -62,7 +59,7 @@ $stmt->execute();
 $res = $stmt->get_result();
 
 $expectedByGrade = [];   // grade => total expected over the selected terms
-$seen = [];              // "grade|term" => true, avoids double counting duplicates
+$seen = [];              // "grade|term" => true (avoids double counting duplicates)
 while ($r = $res->fetch_assoc()) {
     $rowTotal = (float) $r['ExpectedFee'] + (float) $r['ExpectedAssesmentFee']
               + (float) $r['ExpectedActivity'] + (float) $r['ExpectedOther'];
@@ -87,9 +84,9 @@ if ($grade > 0) {
     $params[] = $grade;
 }
 if ($search !== '') {
-    $where[]  = '(firstName LIKE ? OR surname LIKE ? OR Assesment LIKE ? OR CONCAT(firstName, " ", surname) LIKE ?)';
-    $like     = '%' . $search . '%';
-    $types   .= 'ssss';
+    $where[] = '(firstName LIKE ? OR surname LIKE ? OR Assesment LIKE ? OR CONCAT(firstName, " ", surname) LIKE ?)';
+    $like    = '%' . $search . '%';
+    $types  .= 'ssss';
     array_push($params, $like, $like, $like, $like);
 }
 $sql = "SELECT id, Assesment, firstName, surname, Grade FROM Student"
@@ -104,8 +101,8 @@ $res = $stmt->get_result();
 
 $byId = [];
 while ($r = $res->fetch_assoc()) {
-    $sid = (int) $r['id'];
-    $g   = (int) $r['Grade'];
+    $sid   = (int) $r['id'];
+    $g     = (int) $r['Grade'];
     $first = trim((string) $r['firstName']);
     $last  = trim((string) $r['surname']);
     $byId[$sid] = [
@@ -140,9 +137,9 @@ if ($byId) {
 }
 
 // ── Balance, status, stats ────────────────────────────────
-$totalCollected = 0.0;
+$totalCollected   = 0.0;
 $totalOutstanding = 0.0;
-$withBalance = 0;
+$withBalance      = 0;
 
 foreach ($byId as &$l) {
     $l['balance'] = max(0.0, $l['schoolFee'] - $l['paid']);

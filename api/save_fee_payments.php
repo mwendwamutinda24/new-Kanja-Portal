@@ -3,7 +3,9 @@
 // api/save_fee_payments.php
 //
 // Persist fee entries for all students in one grade/term/year
-// submission. Auto-creates the fee tables on first run.
+// submission. Payments are inserted into the existing `Fees`
+// table (one row per payment, summed by fetch_students.php) and
+// mirrored into `fee_payments_log`, which holds the receipt numbers.
 //
 // Accepts JSON (mobile) or form-encoded (web) bodies:
 //   {
@@ -59,36 +61,16 @@ if (!$conn) {
     exit;
 }
 
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    http_response_code(405);
+    echo json_encode(['success' => false, 'error' => 'Method not allowed']);
+    exit;
+}
+
 // ============================================================
-// STEP 1 — AUTO-CREATE TABLES (idempotent: safe to run every call)
+// STEP 1 — ENSURE THE LOG TABLE EXISTS (idempotent)
 // ============================================================
-function ensure_fee_tables(mysqli $conn) {
-    $sqlFeeRecords = "
-        CREATE TABLE IF NOT EXISTS `fee_records` (
-            `id`              INT AUTO_INCREMENT PRIMARY KEY,
-            `student_id`      INT NOT NULL,
-            `grade`           INT NOT NULL,
-            `term`            VARCHAR(20) NOT NULL,
-            `year`            INT NOT NULL,
-
-            `expected_amount` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
-            `paid_amount`     DECIMAL(10,2) NOT NULL DEFAULT 0.00,
-
-            `school_fee`      DECIMAL(10,2) NOT NULL DEFAULT 0.00,
-            `assessment_fee`  DECIMAL(10,2) NOT NULL DEFAULT 0.00,
-            `activity_fee`    DECIMAL(10,2) NOT NULL DEFAULT 0.00,
-            `other_fee`       DECIMAL(10,2) NOT NULL DEFAULT 0.00,
-
-            `receipt_no`      VARCHAR(40) DEFAULT NULL,
-            `payment_date`    DATETIME DEFAULT CURRENT_TIMESTAMP,
-            `recorded_by`     VARCHAR(80) DEFAULT NULL,
-
-            UNIQUE KEY `uniq_student_term` (`student_id`, `term`, `year`),
-            KEY `idx_grade_term_year` (`grade`, `term`, `year`),
-            KEY `idx_receipt` (`receipt_no`)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-    ";
-
+function ensure_log_table(mysqli $conn) {
     $sqlLog = "
         CREATE TABLE IF NOT EXISTS `fee_payments_log` (
             `id`             INT AUTO_INCREMENT PRIMARY KEY,
@@ -113,19 +95,15 @@ function ensure_fee_tables(mysqli $conn) {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     ";
 
-    $errors = [];
-    if (!$conn->query($sqlFeeRecords)) $errors[] = 'fee_records: ' . $conn->error;
-    if (!$conn->query($sqlLog))        $errors[] = 'fee_payments_log: ' . $conn->error;
-
-    return $errors;
+    return $conn->query($sqlLog) ? null : ('fee_payments_log: ' . $conn->error);
 }
 
-$tableErrors = ensure_fee_tables($conn);
-if ($tableErrors) {
+$tableError = ensure_log_table($conn);
+if ($tableError) {
     http_response_code(500);
     echo json_encode([
         'success' => false,
-        'error'   => 'Could not prepare fee tables: ' . implode(' | ', $tableErrors),
+        'error'   => 'Could not prepare log table: ' . $tableError,
         'hint'    => 'Check DB user has CREATE TABLE privilege.',
     ]);
     exit;
@@ -138,10 +116,16 @@ $rawBody = file_get_contents('php://input');
 $body    = json_decode($rawBody, true);
 if (!is_array($body)) $body = $_POST;
 
-$grade    = isset($body['grade']) ? (int)$body['grade'] : 0;
-$termNum  = isset($body['term'])  ? preg_replace('/[^0-9]/', '', (string)$body['term']) : '';
-$year     = isset($body['year'])  ? (int)$body['year'] : 0;
-$termLabel = $termNum !== '' ? "Term $termNum" : '';
+$grade   = isset($body['grade']) ? (int)$body['grade'] : 0;
+$termNum = isset($body['term'])  ? preg_replace('/[^0-9]/', '', (string)$body['term']) : '';
+$year    = isset($body['year'])  ? (int)$body['year'] : 0;
+
+if (!$grade || $termNum === '' || !$year) {
+    http_response_code(400);
+    echo json_encode(['success' => false, 'error' => 'Missing grade/term/year']);
+    exit;
+}
+$termInt = (int)$termNum;
 
 $fields = ['school_fee', 'assessment_fee', 'activity_fee', 'other_fee'];
 
@@ -167,11 +151,8 @@ foreach ($columnsByField as $col) {
 }
 $studentIds = array_keys($studentIds);
 
-if (!$grade || $termLabel === '' || !$year) {
-    echo json_encode(['success' => false, 'error' => 'Missing grade/term/year']);
-    exit;
-}
 if (empty($studentIds)) {
+    http_response_code(400);
     echo json_encode(['success' => false, 'error' => 'No student rows in payload']);
     exit;
 }
@@ -181,39 +162,28 @@ $recordedBy = $_SESSION['teacher_name']
            ?? 'Staff';
 
 // ============================================================
-// STEP 3 — WRITE TRANSACTIONS
+// STEP 3 — WRITE (single transaction: all rows or none)
 // ============================================================
-$conn->begin_transaction();
+mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
+
 try {
-    $selStmt = $conn->prepare("
-        SELECT id FROM fee_records
-        WHERE student_id = ? AND term = ? AND year = ?
+    $conn->begin_transaction();
+
+    $stuStmt = $conn->prepare("
+        SELECT Assesment, firstName, surname
+        FROM Student
+        WHERE id = ?
         LIMIT 1
     ");
-    $insStmt = $conn->prepare("
-        INSERT INTO fee_records
-            (student_id, grade, term, year,
-             expected_amount, paid_amount,
-             school_fee, assessment_fee, activity_fee, other_fee,
-             receipt_no, payment_date, recorded_by)
-        VALUES (?, ?, ?, ?,
-                0, ?,
-                ?, ?, ?, ?,
-                ?, NOW(), ?)
+
+    $feeStmt = $conn->prepare("
+        INSERT INTO Fees
+            (Assesment, StudentID, firstName, surname,
+             Fee, AssesmentFee, Activity, other,
+             Grade, Term, Year, payment_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
     ");
-    $updStmt = $conn->prepare("
-        UPDATE fee_records
-           SET grade          = ?,
-               paid_amount    = paid_amount    + ?,
-               school_fee     = school_fee     + ?,
-               assessment_fee = assessment_fee + ?,
-               activity_fee   = activity_fee   + ?,
-               other_fee      = other_fee      + ?,
-               receipt_no     = ?,
-               payment_date   = NOW(),
-               recorded_by    = ?
-         WHERE student_id = ? AND term = ? AND year = ?
-    ");
+
     $logStmt = $conn->prepare("
         INSERT INTO fee_payments_log
             (receipt_no, student_id, grade, term, year,
@@ -227,47 +197,36 @@ try {
 
     foreach ($studentIds as $sid) {
         $sid        = (int)$sid;
-        $school     = (float)($columnsByField['school_fee'][$sid]     ?? 0);
-        $assessment = (float)($columnsByField['assessment_fee'][$sid] ?? 0);
-        $activity   = (float)($columnsByField['activity_fee'][$sid]   ?? 0);
-        $other      = (float)($columnsByField['other_fee'][$sid]      ?? 0);
+        $school     = max(0, (float)($columnsByField['school_fee'][$sid]     ?? 0));
+        $assessment = max(0, (float)($columnsByField['assessment_fee'][$sid] ?? 0));
+        $activity   = max(0, (float)($columnsByField['activity_fee'][$sid]   ?? 0));
+        $other      = max(0, (float)($columnsByField['other_fee'][$sid]      ?? 0));
         $total      = $school + $assessment + $activity + $other;
 
         if ($total <= 0) continue; // teacher left this row blank
 
+        // Look up the learner so the Fees row carries the same details
+        // the rest of the system expects
+        $stuStmt->bind_param('i', $sid);
+        $stuStmt->execute();
+        $stu = $stuStmt->get_result()->fetch_assoc();
+        if (!$stu) continue; // unknown student id
+
         $receiptNo = 'REC-' . date('Ymd') . '-' . strtoupper(bin2hex(random_bytes(3)));
 
-        // Does a row already exist?
-        $selStmt->bind_param('isi', $sid, $termLabel, $year);
-        $selStmt->execute();
-        $existing = $selStmt->get_result()->fetch_assoc();
-        $selStmt->free_result();
+        // Fees row — types: s i s s d d d d i i i  (11)
+        $feeStmt->bind_param(
+            'sissddddiii',
+            $stu['Assesment'], $sid, $stu['firstName'], $stu['surname'],
+            $school, $assessment, $activity, $other,
+            $grade, $termInt, $year
+        );
+        $feeStmt->execute();
 
-        if ($existing) {
-            // UPDATE — types: i d d d d d s s i s i
-            $updStmt->bind_param(
-                'idddddssisi',
-                $grade,
-                $total, $school, $assessment, $activity, $other,
-                $receiptNo, $recordedBy,
-                $sid, $termLabel, $year
-            );
-            $updStmt->execute();
-        } else {
-            // INSERT — types: i i s i d d d d d s s
-            $insStmt->bind_param(
-                'iisiddddss',
-                $sid, $grade, $termLabel, $year,
-                $total, $school, $assessment, $activity, $other,
-                $receiptNo, $recordedBy
-            );
-            $insStmt->execute();
-        }
-
-        // Audit log
+        // Audit log — types: s i i s i d d d d d s  (11)
         $logStmt->bind_param(
-            'siisssssds',
-            $receiptNo, $sid, $grade, $termLabel, $year,
+            'siisiddddds',
+            $receiptNo, $sid, $grade, $termNum, $year,
             $school, $assessment, $activity, $other,
             $total, $recordedBy
         );
@@ -281,17 +240,27 @@ try {
         $savedCount++;
     }
 
+    if ($savedCount === 0) {
+        $conn->rollback();
+        http_response_code(400);
+        echo json_encode([
+            'success' => false,
+            'error'   => 'No valid fee amounts to save.',
+        ]);
+        exit;
+    }
+
     $conn->commit();
 
     echo json_encode([
         'success'  => true,
         'saved'    => $savedCount,
         'receipts' => $receipts,
-        'message'  => $savedCount . ' payment' . ($savedCount === 1 ? '' : 's') . ' recorded.',
+        'message'  => $savedCount . ' payment' . ($savedCount === 1 ? '' : 's') . ' recorded successfully.',
     ]);
 
 } catch (Throwable $e) {
-    $conn->rollback();
+    try { $conn->rollback(); } catch (Throwable $ignore) {}
     http_response_code(500);
     echo json_encode([
         'success' => false,

@@ -1,21 +1,27 @@
 <?php
 /**
  * POST /api/register_teacher.php
- *
- * Mobile (Kanja Portal) endpoint for the "Register Teacher" screen.
+ * Body (JSON): name, email, phone, tsc?, role, grade?, subject?
  * Only an HOI / Deputy HOI can register a teacher.
- * Auth'd via Bearer token, returns the standard { ok, ... } / { ok:false, error, message }
- * envelope used by every api/*.php endpoint (see api/helpers/response.php).
+ * Returns { ok:true, teacherId, name } or { ok:false, error, message }.
  */
-
-header('Content-Type: application/json');
 mysqli_report(MYSQLI_REPORT_OFF);
+require __DIR__ . '/../conn.php';
+require __DIR__ . '/auth_check.php';
 
-include 'conn.php';
-include 'auth.php'; // <-- adjust to wherever your existing verifyToken()/Bearer-auth helper lives
+header('Content-Type: application/json; charset=utf-8');
+header('Access-Control-Allow-Origin: *');
+header('Access-Control-Allow-Headers: Content-Type, Authorization');
+header('Access-Control-Allow-Methods: POST, OPTIONS');
 
-// Swap for api/helpers/response.php's respondOk()/respondError() if that's where
-// the shared envelope actually lives — same note as in register_student.php.
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    http_response_code(204);
+    exit;
+}
+
+ini_set('display_errors', '0');
+error_reporting(E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED);
+
 function respondOk(array $data = [], int $status = 200): void {
     http_response_code($status);
     echo json_encode(array_merge(['ok' => true], $data));
@@ -27,46 +33,57 @@ function respondError(string $message, int $status = 400, string $error = 'error
     exit;
 }
 
+register_shutdown_function(function () {
+    $e = error_get_last();
+    if ($e && in_array($e['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
+        if (!headers_sent()) header('Content-Type: application/json; charset=utf-8');
+        http_response_code(500);
+        echo json_encode(['ok' => false, 'error' => 'fatal', 'message' => 'Server error: ' . $e['message']]);
+    }
+});
+
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     respondError('Method not allowed', 405, 'method_not_allowed');
 }
-
-/* ---- Auth ---- */
-$authHeader = $_SERVER['HTTP_AUTHORIZATION'] ?? ($_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '');
-if (!preg_match('/Bearer\s+(\S+)/i', $authHeader, $m)) {
-    respondError('Missing bearer token', 401, 'no_token');
+if (!$conn) {
+    respondError('DB connection failed', 500, 'db_error');
 }
-$token = $m[1];
 
-// TODO: replace with your real helper — assumes a `tokens` table
-// (token, user_id, role, expires_at) shared with subjects.php / students.php.
-$user = verifyToken($conn, $token);
-if (!$user) {
-    respondError('Invalid or expired token', 401, 'invalid_token');
-}
-// Only Head of Institution / Deputy can register teachers.
-if (!in_array($user['role'], ['hoi', 'Dhoi'], true)) {
+/* ---- Auth (same helper as the other endpoints) ---- */
+$session = require_auth();
+
+// ASSUMPTION: $session['role'] holds the logged-in user's role.
+// If your auth_check.php names it differently, change it here.
+$myRole = strtolower(trim((string) ($session['role'] ?? '')));
+$managerRoles = ['hoi', 'dhoi', 'head of instituion', 'head of institution'];
+if (!in_array($myRole, $managerRoles, true)) {
     respondError('Not authorized to register teachers', 403, 'forbidden');
 }
 
-/* ---- Body: apiRequest() always sends JSON when auth=true ---- */
-$raw = file_get_contents('php://input');
-$input = json_decode($raw, true);
-if (!is_array($input)) {
-    $input = $_POST; // fallback for form-urlencoded callers
+/* ---- Body ---- */
+$input = json_decode(file_get_contents('php://input'), true);
+if (!is_array($input)) $input = $_POST;
+
+$name    = trim((string) ($input['name'] ?? ''));
+$email   = trim((string) ($input['email'] ?? ''));
+$phone   = trim((string) ($input['phone'] ?? ''));
+$tsc     = trim((string) ($input['tsc'] ?? ''));
+$role    = trim((string) ($input['role'] ?? ''));
+$grade   = trim((string) ($input['grade'] ?? ''));
+$subject = trim((string) ($input['subject'] ?? ''));
+
+/* ---- Normalise ---- */
+// "0712 345 678", "0712-345-678", "+254712345678" -> "0712345678"
+$phone = preg_replace('/[\s\-()]/', '', $phone);
+if (preg_match('/^\+?254(\d{9})$/', $phone, $pm)) {
+    $phone = '0' . $pm[1];
 }
+// "grade5" / "Grade 5" -> 5 ; empty -> 0 (classTeacher is an INT column)
+$gradeNum = (int) preg_replace('/\D/', '', $grade);
+// Missing TSC is stored as 0, matching your existing rows
+$tscValue = $tsc !== '' ? $tsc : '0';
 
-$name    = trim($input['name'] ?? '');
-$email   = trim($input['email'] ?? '');
-$phone   = trim($input['phone'] ?? '');
-$tsc     = trim($input['tsc'] ?? '');
-$role    = trim($input['role'] ?? '');
-$grade   = trim($input['grade'] ?? '');   // "Class Teacher For" — optional
-$subject = trim($input['subject'] ?? ''); // optional
-
-/* ---- Validation ----
- * Matches the ✦-marked fields on the mobile form: name, email, phone, role.
- */
+/* ---- Validation ---- */
 $allowedRoles = ['hoi', 'Dhoi', 'Senior', 'teacher'];
 
 if ($name === '' || $email === '' || $phone === '' || $role === '') {
@@ -84,9 +101,16 @@ if (!in_array($role, $allowedRoles, true)) {
 if ($tsc !== '' && !ctype_digit($tsc)) {
     respondError('TSC number must be numeric', 422, 'validation_error');
 }
+if ($gradeNum < 0 || $gradeNum > 9) {
+    respondError('Grade must be between 1 and 9', 422, 'validation_error');
+}
 
-/* ---- Duplicate email check ---- */
+/* ---- Duplicate email ---- */
 $check = $conn->prepare("SELECT id FROM Teachers WHERE email = ? LIMIT 1");
+if (!$check) {
+    error_log('register_teacher.php check prepare failed: ' . $conn->error);
+    respondError('Server error', 500, 'server_error');
+}
 $check->bind_param('s', $email);
 $check->execute();
 if ($check->get_result()->num_rows > 0) {
@@ -95,7 +119,7 @@ if ($check->get_result()->num_rows > 0) {
 }
 $check->close();
 
-/* ---- Insert (prepared statement — no raw concatenation) ---- */
+/* ---- Insert ---- */
 $stmt = $conn->prepare(
     "INSERT INTO Teachers (name, email, phoneNo, tscNo, role, classTeacher, subject)
      VALUES (?, ?, ?, ?, ?, ?, ?)"
@@ -105,23 +129,21 @@ if (!$stmt) {
     respondError('Server error', 500, 'server_error');
 }
 
-$tscValue   = $tsc !== '' ? $tsc : null;
-$gradeValue = $grade !== '' ? $grade : null;
-$subjValue  = $subject !== '' ? $subject : null;
-
-$stmt->bind_param(
-    'sssssss',
-    $name, $email, $phone, $tscValue, $role, $gradeValue, $subjValue
-);
+// types: s s s s s i s
+$stmt->bind_param('sssssis', $name, $email, $phone, $tscValue, $role, $gradeNum, $subject);
 
 if ($stmt->execute()) {
     $newId = $stmt->insert_id;
     $stmt->close();
-    $conn->close();
     respondOk(['teacherId' => $newId, 'name' => $name], 201);
-} else {
-    error_log('register_teacher.php insert failed: ' . $stmt->error);
-    $stmt->close();
-    $conn->close();
-    respondError('Insert failed', 500, 'insert_failed');
 }
+
+error_log('register_teacher.php insert failed: ' . $stmt->error);
+$detail = $stmt->error;
+$stmt->close();
+// "detail" is handy while debugging; remove it once everything works.
+http_response_code(500);
+echo json_encode([
+    'ok' => false, 'error' => 'insert_failed',
+    'message' => 'Insert failed', 'detail' => $detail,
+]);

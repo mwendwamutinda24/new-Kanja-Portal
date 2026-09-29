@@ -3,20 +3,16 @@
 // api/save_fee_payments.php
 //
 // Persist fee entries for all students in one grade/term/year
-// submission. Payments are inserted into the existing `Fees`
-// table (one row per payment, summed by fetch_students.php) and
-// mirrored into `fee_payments_log`, which holds the receipt numbers.
+// submission. Each payment is inserted into `Fees` (one row per
+// payment, with its receipt_no) and mirrored into
+// `fee_payments_log`.
 //
 // Accepts JSON (mobile) or form-encoded (web) bodies:
-//   {
-//     "grade": 6,
-//     "term":  "3",
-//     "year":  2026,
-//     "school_fee":     { "284": 100, "285": 250, ... },
+//   { "grade": 6, "term": "3", "year": 2026,
+//     "school_fee":     { "284": 100, "285": 250 },
 //     "assessment_fee": { ... },   // optional
 //     "activity_fee":   { ... },   // optional
-//     "other_fee":      { ... }    // optional
-//   }
+//     "other_fee":      { ... } }  // optional
 //
 // Returns:
 //   { success, saved, receipts:[{student_id, receipt_no, total}], message }
@@ -25,7 +21,6 @@
 session_start();
 include __DIR__ . '/../conn.php';
 
-// ── CORS + JSON ────────────────────────────────────────────
 header('Content-Type: application/json; charset=utf-8');
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Headers: Content-Type, Authorization');
@@ -36,11 +31,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit;
 }
 
-// Never leak PHP warnings into the JSON body
 ini_set('display_errors', '0');
 error_reporting(E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED);
 
-// Convert fatal errors into a JSON reply instead of a blank 500
 register_shutdown_function(function () {
     $e = error_get_last();
     if ($e && in_array($e['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
@@ -68,9 +61,12 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
 }
 
 // ============================================================
-// STEP 1 — ENSURE THE LOG TABLE EXISTS (idempotent)
+// STEP 1 — SCHEMA PREPARATION (idempotent)
+// Must run BEFORE begin_transaction(): ALTER/CREATE commit implicitly.
 // ============================================================
-function ensure_log_table(mysqli $conn) {
+function prepare_schema(mysqli $conn) {
+    $errors = [];
+
     $sqlLog = "
         CREATE TABLE IF NOT EXISTS `fee_payments_log` (
             `id`             INT AUTO_INCREMENT PRIMARY KEY,
@@ -94,17 +90,26 @@ function ensure_log_table(mysqli $conn) {
             KEY `idx_grade_term_year` (`grade`, `term`, `year`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     ";
+    if (!$conn->query($sqlLog)) $errors[] = 'fee_payments_log: ' . $conn->error;
 
-    return $conn->query($sqlLog) ? null : ('fee_payments_log: ' . $conn->error);
+    // Fees must carry the receipt number (download_receipt.php reads it from Fees)
+    $col = $conn->query("SHOW COLUMNS FROM Fees LIKE 'receipt_no'");
+    if ($col && $col->num_rows === 0) {
+        if (!$conn->query("ALTER TABLE Fees ADD COLUMN receipt_no VARCHAR(40) NULL, ADD INDEX idx_receipt (receipt_no)")) {
+            $errors[] = 'Fees.receipt_no: ' . $conn->error;
+        }
+    }
+
+    return $errors;
 }
 
-$tableError = ensure_log_table($conn);
-if ($tableError) {
+$schemaErrors = prepare_schema($conn);
+if ($schemaErrors) {
     http_response_code(500);
     echo json_encode([
         'success' => false,
-        'error'   => 'Could not prepare log table: ' . $tableError,
-        'hint'    => 'Check DB user has CREATE TABLE privilege.',
+        'error'   => 'Could not prepare tables: ' . implode(' | ', $schemaErrors),
+        'hint'    => 'Check DB user has CREATE/ALTER TABLE privilege.',
     ]);
     exit;
 }
@@ -129,7 +134,7 @@ $termInt = (int)$termNum;
 
 $fields = ['school_fee', 'assessment_fee', 'activity_fee', 'other_fee'];
 
-// Normalise the payload: accept either nested arrays or "field[ID]" keys
+// Accept either nested arrays or "field[ID]" keys
 $columnsByField = [];
 foreach ($fields as $f) {
     if (isset($body[$f]) && is_array($body[$f])) {
@@ -144,7 +149,6 @@ foreach ($fields as $f) {
     }
 }
 
-// Union of student IDs found in any field
 $studentIds = [];
 foreach ($columnsByField as $col) {
     foreach (array_keys($col) as $sid) $studentIds[(int)$sid] = true;
@@ -180,8 +184,8 @@ try {
         INSERT INTO Fees
             (Assesment, StudentID, firstName, surname,
              Fee, AssesmentFee, Activity, other,
-             Grade, Term, Year, payment_date)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+             Grade, Term, Year, receipt_no, payment_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
     ");
 
     $logStmt = $conn->prepare("
@@ -203,10 +207,8 @@ try {
         $other      = max(0, (float)($columnsByField['other_fee'][$sid]      ?? 0));
         $total      = $school + $assessment + $activity + $other;
 
-        if ($total <= 0) continue; // teacher left this row blank
+        if ($total <= 0) continue; // blank row
 
-        // Look up the learner so the Fees row carries the same details
-        // the rest of the system expects
         $stuStmt->bind_param('i', $sid);
         $stuStmt->execute();
         $stu = $stuStmt->get_result()->fetch_assoc();
@@ -214,12 +216,12 @@ try {
 
         $receiptNo = 'REC-' . date('Ymd') . '-' . strtoupper(bin2hex(random_bytes(3)));
 
-        // Fees row — types: s i s s d d d d i i i  (11)
+        // Fees row — types: s i s s d d d d i i i s  (12)
         $feeStmt->bind_param(
-            'sissddddiii',
+            'sissddddiiis',
             $stu['Assesment'], $sid, $stu['firstName'], $stu['surname'],
             $school, $assessment, $activity, $other,
-            $grade, $termInt, $year
+            $grade, $termInt, $year, $receiptNo
         );
         $feeStmt->execute();
 
@@ -243,10 +245,7 @@ try {
     if ($savedCount === 0) {
         $conn->rollback();
         http_response_code(400);
-        echo json_encode([
-            'success' => false,
-            'error'   => 'No valid fee amounts to save.',
-        ]);
+        echo json_encode(['success' => false, 'error' => 'No valid fee amounts to save.']);
         exit;
     }
 

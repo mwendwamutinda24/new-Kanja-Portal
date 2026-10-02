@@ -5,18 +5,36 @@ header('Access-Control-Allow-Methods: POST, OPTIONS');
 header('Access-Control-Allow-Headers: Content-Type, Authorization');
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(204); exit; }
 
-require __DIR__ . '/../../conn.php';
-require __DIR__ . '/../auth_check.php';
-require __DIR__ . '/_config.php';
-require __DIR__ . '/_input.php';
-
-mysqli_report(MYSQLI_REPORT_OFF);
+ini_set('display_errors', '0');
 
 function respond($data, $code = 200) {
     http_response_code($code);
     echo json_encode($data);
     exit;
 }
+
+// Any uncaught error or fatal comes back as JSON, so the phone shows the
+// real reason instead of an empty / HTML 500 page.
+set_exception_handler(function ($e) {
+    respond(['success' => false, 'message' => 'Server error: ' . $e->getMessage()], 500);
+});
+register_shutdown_function(function () {
+    $err = error_get_last();
+    if ($err && in_array($err['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
+        if (!headers_sent()) {
+            http_response_code(500);
+            header('Content-Type: application/json');
+        }
+        echo json_encode(['success' => false, 'message' => 'Fatal: ' . $err['message']]);
+    }
+});
+
+require __DIR__ . '/../../conn.php';
+require __DIR__ . '/../auth_check.php';
+require __DIR__ . '/_config.php';
+require __DIR__ . '/_input.php';
+
+mysqli_report(MYSQLI_REPORT_OFF);
 
 $session = require_auth();
 if (!in_array($session['role'], ['teacher', 'hoi'], true)) {
@@ -72,6 +90,25 @@ if ($termDigits !== '') {
 }
 $termInClause = implode(',', array_unique($termCandidates));
 
+/*
+ * Look the student up. MySQL on Linux (Render / Railway) treats table names
+ * as case-sensitive while Windows does not, so try "Student" and then
+ * "student". Returns the result set, or false with the real DB error in $err.
+ */
+function skp_find_student($conn, $idInt, $gradeSafe, &$err) {
+    $err = '';
+    foreach (['Student', 'student'] as $table) {
+        $res = mysqli_query(
+            $conn,
+            "SELECT id, Assesment, firstName, surname FROM `$table`
+             WHERE id = $idInt AND Grade = '$gradeSafe' LIMIT 1"
+        );
+        if ($res !== false) return $res;
+        $err = mysqli_error($conn);
+    }
+    return false;
+}
+
 $saved = 0;
 $skipped = 0;
 $errors = [];
@@ -108,12 +145,14 @@ foreach ($students as $entry) {
 
     // Confirm the student exists in this grade, and grab the identity
     // fields exam2 also stores (Assesment, firstName, lastName).
-    $chk = mysqli_query(
-        $conn,
-        "SELECT id, Assesment, firstName, surname FROM Student
-         WHERE id = $studentIdInt AND Grade = '$gradeSafe' LIMIT 1"
-    );
-    if (!$chk || mysqli_num_rows($chk) === 0) {
+    $lookupErr = '';
+    $chk = skp_find_student($conn, $studentIdInt, $gradeSafe, $lookupErr);
+    if ($chk === false) {
+        $errors[] = "Student lookup failed for $studentId: $lookupErr";
+        $skipped++;
+        continue;
+    }
+    if (mysqli_num_rows($chk) === 0) {
         $errors[] = "Student $studentId not found in Grade $grade";
         $skipped++;
         continue;
@@ -171,7 +210,7 @@ foreach ($students as $entry) {
             ],
             array_values($marks)
         );
-        $colsSql = implode(', ', array_map(fn($c) => "`$c`", $cols));
+        $colsSql = implode(', ', array_map(function ($c) { return "`$c`"; }, $cols));
         $valsSql = implode(', ', $vals);
 
         $ok = mysqli_query($conn, "INSERT INTO exam2 ($colsSql) VALUES ($valsSql)");
